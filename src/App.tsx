@@ -51,7 +51,7 @@ export default function App() {
 }
 
 function Shell() {
-  const { state: sessions } = useSessions();
+  const { state: sessions, touch } = useSessions();
   const [phase, setPhase] = useState<Phase>({ name: "probing" });
   // What the engine advertised at initialize. Null only if the capability
   // read itself failed, which every consumer treats as "engine said nothing".
@@ -174,6 +174,26 @@ function Shell() {
   // permission request turns amber wherever the user happens to be.
   const sessionStatus = useMemo(() => statusById(sessions), [sessions]);
 
+  // The view is remounted per SLOT, not per target: a fresh target is a new
+  // slot (so its timeline starts empty), while re-selecting a session that is
+  // already resident resolves to the slot it already has — no remount, no
+  // reset, and no second session/load.
+  const viewKey = resolveKey(sessions, target);
+  const activeEntry = getEntry(sessions, viewKey);
+  // Which row the sidebar highlights. Derived rather than tracked: a fresh
+  // slot has no id until session/new answers, and then it just appears.
+  const activeSessionId = activeEntry?.sessionId ?? null;
+
+  // Tell the store which slot is in front, which is also when it trims
+  // residency down to the sessions worth keeping alive. Computed before the
+  // gate returns below so the hook order never changes; with an empty store it
+  // is a no-op. activeEntry?.key is in the dependency list because a brand-new
+  // slot is dispatched by the child view's effect, one commit AFTER this one —
+  // re-running once it lands is what lets the new slot count itself.
+  useEffect(() => {
+    touch(viewKey);
+  }, [touch, viewKey, activeEntry?.key]);
+
   if (phase.name === "probing") {
     return <Gate title="Packetcode" body="Checking for the packetcode engine…" />;
   }
@@ -213,15 +233,6 @@ function Shell() {
       />
     );
   }
-
-  // The view is remounted per SLOT, not per target: a fresh target is a new
-  // slot (so its timeline starts empty), while re-selecting a session that is
-  // already resident resolves to the slot it already has — no remount, no
-  // reset, and no second session/load.
-  const viewKey = resolveKey(sessions, target);
-  // Which row the sidebar highlights. Derived rather than tracked: a fresh
-  // slot has no id until session/new answers, and then it just appears.
-  const activeSessionId = getEntry(sessions, viewKey)?.sessionId ?? null;
 
   // A load target brings its own recorded workingDir; anything else runs in
   // the selected project. No directory at all means there is nothing safe to

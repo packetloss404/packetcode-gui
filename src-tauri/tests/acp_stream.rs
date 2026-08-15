@@ -4,9 +4,9 @@
 //! instead of a Tauri AppHandle; no packetcode binary is required.
 
 use packetcode_gui_lib::engine::{
-    cancel_on, capabilities_of, list_commands_on, new_session_on, permission_reply_on,
-    prompt_on, rename_session_on, search_files_on, session_usage_on, start_engine, stop_on,
-    AcpEvents, EngineState, PromptOutcome, SessionUsage, PERMISSION_MODES,
+    cancel_on, capabilities_of, close_session_on, list_commands_on, new_session_on,
+    permission_reply_on, prompt_on, rename_session_on, search_files_on, session_usage_on,
+    start_engine, stop_on, AcpEvents, EngineState, PromptOutcome, SessionUsage, PERMISSION_MODES,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -618,6 +618,102 @@ async fn composer_affordances_are_empty_on_engines_without_the_extensions() {
         .expect("project/files timed out")
         .expect("project/files should not error on -32601");
     assert!(files.is_empty(), "expected no files, got {files:?}");
+
+    stop_on(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn close_session_releases_it_and_is_idempotent() {
+    // Eviction leans on this: closing must actually retire the session in the
+    // engine, not just be answered. The mock proves it the way the real engine
+    // does — a prompt for a closed session is an unknown sessionId.
+    let (state, _rx) = start_mock().await;
+    let caps = capabilities_of(&state).await;
+    assert!(
+        caps.session_close,
+        "the mock advertises sessionCapabilities.close"
+    );
+
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    timeout(STEP, close_session_on(&state, &session))
+        .await
+        .expect("session/close timed out")
+        .expect("session/close failed");
+
+    let err = prompt_on(&state, &session, "anyone home")
+        .await
+        .expect_err("a closed session must not accept prompts");
+    assert!(
+        err.contains("-32602"),
+        "expected unknown-session after close, got: {err}"
+    );
+
+    // Closing again, and closing something never opened, are both fine: a
+    // client racing its own eviction must not have to swallow an error.
+    for id in [session.as_str(), "never-existed"] {
+        timeout(STEP, close_session_on(&state, id))
+            .await
+            .expect("repeat session/close timed out")
+            .expect("repeat session/close should succeed");
+    }
+
+    stop_on(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn close_session_cancels_an_in_flight_turn() {
+    // The spec says a busy session is cancelled rather than rejected, so the
+    // turn still gets a proper ending instead of being orphaned. Eviction
+    // never targets a running session, but a close racing a turn that just
+    // started must not strand the prompt.
+    let (state, mut rx) = start_mock().await;
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+
+    let turn = spawn_prompt(&state, &session, "slow demo");
+    let u = next_update(&mut rx).await;
+    assert_eq!(kind(&u), "agent_thought_chunk");
+
+    timeout(STEP, close_session_on(&state, &session))
+        .await
+        .expect("session/close timed out")
+        .expect("session/close failed");
+
+    let outcome = timeout(STEP, turn)
+        .await
+        .expect("prompt hung after its session was closed")
+        .expect("prompt task panicked")
+        .expect("a cancelled turn still resolves");
+    assert_eq!(outcome.stop_reason, "cancelled");
+
+    stop_on(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn close_session_on_engine_without_the_method_degrades() {
+    // --no-close is an engine predating session/close: it advertises no
+    // sessionCapabilities.close and answers -32601. Eviction must still be
+    // allowed to proceed (it frees this client's transcript either way), so
+    // the bridge reports success and the session stays usable in the engine.
+    let (state, _rx) = start_mock_with(&["--no-close"]).await;
+    let caps = capabilities_of(&state).await;
+    assert!(
+        !caps.session_close,
+        "an engine without the capability must not advertise it"
+    );
+
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    timeout(STEP, close_session_on(&state, &session))
+        .await
+        .expect("session/close timed out")
+        .expect("-32601 must degrade to Ok, not fail the eviction");
+
+    // Nothing was released, so the session still answers — which is exactly
+    // why the client keeps evicting anyway rather than pinning the transcript.
+    let outcome = timeout(STEP, prompt_on(&state, &session, "garbage"))
+        .await
+        .expect("prompt timed out")
+        .expect("the session should still be live on an engine that cannot close");
+    assert_eq!(outcome.stop_reason, "end_turn");
 
     stop_on(&state).await.unwrap();
 }

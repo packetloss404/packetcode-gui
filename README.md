@@ -11,6 +11,7 @@ Packetcode Desktop does **not** bundle or reimplement the agent. It drives the s
 - **Interactive approvals** — packetcode's permission requests surface as inline cards; allow or reject without leaving the flow
 - **Per-session permission modes** — read-only through bypass, chosen in the composer, enforced (and capped) by the engine
 - **Concurrent sessions** — start a turn, switch away, come back to it finished; sidebar dots show running (blue) and needs-approval (amber) per session
+- **Bounded residency** — idle sessions you have moved on from are handed back with ACP `session/close`, so browsing history no longer piles up live runtimes (and their MCP processes) inside the engine; anything running or waiting on an approval is never released, and reopening a released session just resumes it
 - **Session history & resume** — sessions grouped by project, resumed over ACP `session/load` with full transcript replay, live titles, inline rename
 - **Slash commands and @ mentions** — the composer's `/` menu lists your markdown commands (the engine expands them server-side) and `@` searches project files
 - **Model picker** — per-session provider/model choice served by the engine's model catalog

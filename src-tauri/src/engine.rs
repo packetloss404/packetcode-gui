@@ -113,6 +113,11 @@ pub struct EngineCapabilities {
     pub protocol_version: u64,
     /// Spec capability: whether `session/load` may be used to resume.
     pub load_session: bool,
+    /// Spec capability (`sessionCapabilities.close`): whether the engine can
+    /// release a session's runtime on request. False for engines that predate
+    /// it — eviction there still drops the client-side transcript, but the
+    /// engine keeps its runtime until a re-load supersedes it.
+    pub session_close: bool,
     pub packetcode: PacketcodeCapabilities,
 }
 
@@ -169,6 +174,16 @@ fn parse_capabilities(result: &Value) -> EngineCapabilities {
             .and_then(|a| a.get("loadSession"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // SessionCapabilities is object-shaped, not boolean-shaped: the spec
+        // says `{}` means supported while an absent or null field means the
+        // agent does not advertise it. Anything else (a stray `true`, a
+        // number) is not the shape the spec defines, so it is not taken as
+        // support.
+        session_close: agent
+            .and_then(|a| a.get("sessionCapabilities"))
+            .and_then(|s| s.get("close"))
+            .map(Value::is_object)
+            .unwrap_or(false),
         packetcode: PacketcodeCapabilities {
             advertised: ext.is_some(),
             sessions_list: flag("sessionsList"),
@@ -215,7 +230,10 @@ pub struct AcpBridge {
     /// ("packetcode-permission-1"), so the raw id Value is stored and echoed
     /// back verbatim in the reply frame.
     permission_waiters: Mutex<HashMap<String, PendingPermission>>,
-    stdin: Mutex<ChildStdin>,
+    /// The engine's stdin, or None once it has been closed. Held in an Option
+    /// purely so it can be DROPPED: closing the pipe is what makes the
+    /// engine's ACP loop return and run its own shutdown (see close_stdin).
+    stdin: Mutex<Option<ChildStdin>>,
 }
 
 /// One unanswered `session/request_permission`. The session id is kept next to
@@ -239,7 +257,7 @@ impl AcpBridge {
             next_request_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             permission_waiters: Mutex::new(HashMap::new()),
-            stdin: Mutex::new(stdin),
+            stdin: Mutex::new(Some(stdin)),
         });
         let reader = bridge.clone();
         tokio::spawn(async move {
@@ -319,12 +337,24 @@ impl AcpBridge {
     async fn write_line(&self, frame: &Value) -> Result<(), String> {
         let mut line = frame.to_string();
         line.push('\n');
-        self.stdin
-            .lock()
-            .await
+        let mut guard = self.stdin.lock().await;
+        let stdin = guard.as_mut().ok_or("engine stdin is closed")?;
+        stdin
             .write_all(line.as_bytes())
             .await
             .map_err(|e| format!("engine write failed: {e}"))
+    }
+
+    /// Closes the engine's stdin, which is the ONLY graceful way to stop it:
+    /// its ACP loop returns on end-of-input and then runs its own shutdown,
+    /// releasing every session's runtime and, with them, the MCP child
+    /// processes those sessions started. Killing the engine outright (what
+    /// `kill_on_drop` does when this process exits) skips all of that and
+    /// leaves those grandchildren orphaned.
+    pub async fn close_stdin(&self) {
+        // Dropping the handle is what closes the pipe; tokio's AsyncWrite
+        // shutdown for ChildStdin does not.
+        drop(self.stdin.lock().await.take());
     }
 
     /// Sends a request and awaits its response. The stdin lock is held only
@@ -904,6 +934,42 @@ pub async fn engine_cancel(session_id: String, state: State<'_, EngineState>) ->
     cancel_on(&state, &session_id).await
 }
 
+/// Releases a session's engine-side runtime via the spec's `session/close`.
+///
+/// This is what makes client-side eviction real: without it, every session the
+/// user ever opened keeps a provider registry, a tool registry, a backup
+/// manager, its whole transcript, and one MCP child process per configured
+/// server alive inside the engine until the engine dies.
+///
+/// Engines predating the method answer `-32601`, which degrades to `Ok`
+/// exactly like the optional vendor extensions: eviction then still frees the
+/// client's copy of the transcript, and the stale engine-side runtime is
+/// superseded the next time the session is loaded. `session/close` on an
+/// engine that has it is idempotent, so a doubled or racing eviction is fine.
+pub async fn close_session_on(state: &EngineState, session_id: &str) -> Result<(), String> {
+    let response = bridge_of(state)
+        .await?
+        .request(
+            "session/close",
+            json!({ "sessionId": session_id }),
+            REQUEST_TIMEOUT,
+        )
+        .await;
+    match response {
+        Ok(_) => Ok(()),
+        Err(err) if is_method_not_found(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[tauri::command]
+pub async fn engine_close_session(
+    session_id: String,
+    state: State<'_, EngineState>,
+) -> Result<(), String> {
+    close_session_on(&state, &session_id).await
+}
+
 pub async fn permission_reply_on(
     state: &EngineState,
     request_id: &Value,
@@ -1316,6 +1382,41 @@ pub async fn stop_on(state: &EngineState) -> Result<(), String> {
     Ok(())
 }
 
+/// How long a graceful engine shutdown may take before it is killed anyway.
+/// Short on purpose: quitting the app must never appear to hang.
+const ENGINE_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Stops the engine the polite way, for app exit: close its stdin so its ACP
+/// loop ends normally and runs its own shutdown — every session's runtime
+/// released, every MCP child process shut down — then wait briefly for it to
+/// go, killing it if it will not.
+///
+/// This deliberately does NOT enumerate resident sessions and close them one
+/// by one. End-of-input releases every session the engine holds, including any
+/// this client lost track of, in one write; and it is the one path that also
+/// works on engines too old for `session/close`.
+///
+/// Best-effort by nature. It only runs when this process gets to run code at
+/// all: a window close, or an explicit stop. A crash, a `taskkill /F`, or an
+/// OS-forced logoff kills the app before any of this, and `kill_on_drop` then
+/// kills the engine the same abrupt way — leaving MCP grandchildren orphaned.
+/// There is no client-side fix for that; do not read this as a guarantee.
+pub async fn shutdown_engine_on(state: &EngineState) -> Result<(), String> {
+    let engine = state.inner.lock().await.take();
+    *state.capabilities.lock().await = None;
+    let Some(mut engine) = engine else {
+        return Ok(());
+    };
+    engine.bridge.close_stdin().await;
+    if timeout(ENGINE_EXIT_TIMEOUT, engine.child.wait())
+        .await
+        .is_err()
+    {
+        let _ = engine.child.kill().await;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn engine_stop(state: State<'_, EngineState>) -> Result<(), String> {
     stop_on(&state).await
@@ -1385,7 +1486,8 @@ mod tests {
                 "loadSession": true,
                 "promptCapabilities": { "image": false },
                 "mcpCapabilities": { "http": false },
-                "sessionCapabilities": {},
+                // Advertised the spec's way: "{}" means supported.
+                "sessionCapabilities": { "close": {} },
                 "_packetcode": {
                     "sessionsList": true,
                     "sessionsRename": true,
@@ -1401,6 +1503,7 @@ mod tests {
         }));
         assert_eq!(caps.protocol_version, 1);
         assert!(caps.load_session);
+        assert!(caps.session_close);
         assert!(caps.packetcode.advertised);
         assert!(caps.packetcode.sessions_list);
         assert!(caps.packetcode.sessions_rename);
@@ -1424,6 +1527,9 @@ mod tests {
             "agentInfo": { "name": "packetcode", "version": "0.1.0" }
         }));
         assert!(caps.load_session);
+        // No sessionCapabilities block at all: the engine cannot release
+        // sessions, so eviction frees only this client's copy.
+        assert!(!caps.session_close);
         assert!(!caps.packetcode.advertised);
         assert!(!caps.packetcode.sessions_list);
         assert!(!caps.packetcode.sessions_rename);
@@ -1447,6 +1553,7 @@ mod tests {
             let caps = parse_capabilities(&garbage);
             assert_eq!(caps.protocol_version, 1, "for {garbage}");
             assert!(!caps.load_session, "for {garbage}");
+            assert!(!caps.session_close, "for {garbage}");
             assert!(!caps.packetcode.advertised, "for {garbage}");
             assert_eq!(
                 caps.packetcode.permission_modes,
@@ -1477,5 +1584,24 @@ mod tests {
             "agentCapabilities": { "_packetcode": { "permissionModes": [] } }
         }));
         assert_eq!(caps.packetcode.permission_modes, modes(&PERMISSION_MODES));
+
+        // sessionCapabilities.close is object-shaped. Only "{}" (or an object
+        // with fields, since the type is open) counts; a block that omits it,
+        // nulls it, or sends the boolean an ACP-naive engine might guess at is
+        // not the spec's shape and must not be read as support.
+        for absent in [
+            json!({}),
+            json!({ "close": null }),
+            json!({ "close": true }),
+            json!({ "close": "yes" }),
+        ] {
+            let caps =
+                parse_capabilities(&json!({ "agentCapabilities": { "sessionCapabilities": absent } }));
+            assert!(!caps.session_close, "for {absent}");
+        }
+        let caps = parse_capabilities(
+            &json!({ "agentCapabilities": { "sessionCapabilities": { "close": {} } } }),
+        );
+        assert!(caps.session_close);
     }
 }

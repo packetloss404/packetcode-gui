@@ -26,6 +26,7 @@ import {
 } from "react";
 import {
   cancel as acpCancel,
+  closeSession,
   loadSession,
   newSession,
   prompt,
@@ -42,7 +43,9 @@ import { attachRouter, routerReady } from "./router";
 import {
   getEntry,
   initialStore,
+  planEviction,
   reduce,
+  type Action,
   type SessionKey,
   type SessionTarget,
   type StoreState,
@@ -60,6 +63,11 @@ export interface SessionsApi {
     model: ModelOption | null,
     permissionMode: PermissionMode | null,
   ) => void;
+  /** Report which slot is now on screen. Also the eviction tick: residency
+   * only ever grows when a session is opened or revisited, so that is the one
+   * moment it needs trimming. Safe to call with a key the store does not hold
+   * (a slot whose open has not landed yet) and safe to call repeatedly. */
+  touch: (key: SessionKey) => void;
   send: (key: SessionKey, text: string) => void;
   stop: (key: SessionKey) => void;
   answerPermission: (
@@ -194,6 +202,42 @@ export function SessionsProvider(props: { children: ReactNode }) {
     [],
   );
 
+  // Bounded residency. Every resident session costs the engine a runtime —
+  // registries, a backup manager, the whole transcript, one child process per
+  // configured MCP server — and nothing used to give one back, so browsing
+  // history pinned a runtime per row for the engine's lifetime.
+  //
+  // Eviction is designed to be invisible. planEviction never picks a running
+  // session, a session with an unanswered permission request, the visible
+  // slot, or a slot whose open is still in flight; and an evicted session is
+  // not lost, because re-selecting it loads it again from the engine's
+  // persisted transcript into a fresh slot.
+  const touch = useCallback((key: SessionKey) => {
+    const touched: Action = { type: "touch", key };
+    dispatch(touched);
+    // Plan against the state this touch PRODUCES, not the one before it: the
+    // slot the user just moved to has to be the freshest thing in the store,
+    // or its own activation could choose it as a victim. reduce is pure, so
+    // computing that state here costs nothing and stays in step with the
+    // dispatch React has not applied yet.
+    const victims = planEviction(reduce(stateRef.current, touched), key);
+    if (victims.length === 0) return;
+    dispatch({ type: "evict", keys: victims.map((victim) => victim.key) });
+    for (const victim of victims) {
+      // Reopen the load-once gate. Without this, re-selecting the session
+      // would resolve to a slot the store no longer has and quietly render
+      // nothing, because open() would decide it had already started.
+      startedRef.current.delete(victim.key);
+      turnSeqRef.current.delete(victim.key);
+      // Only a slot that actually reached the engine has a runtime to release.
+      // Best-effort: a close that fails costs an engine-side runtime, not
+      // correctness, and the entry is gone from this app either way.
+      if (victim.ready && victim.sessionId !== null) {
+        void closeSession(victim.sessionId).catch(() => {});
+      }
+    }
+  }, []);
+
   const send = useCallback((key: SessionKey, text: string) => {
     const entry = getEntry(stateRef.current, key);
     if (!entry || !entry.ready || entry.sessionId === null || entry.busy) return;
@@ -251,8 +295,8 @@ export function SessionsProvider(props: { children: ReactNode }) {
   );
 
   const api = useMemo<SessionsApi>(
-    () => ({ state, open, send, stop, answerPermission }),
-    [state, open, send, stop, answerPermission],
+    () => ({ state, open, touch, send, stop, answerPermission }),
+    [state, open, touch, send, stop, answerPermission],
   );
 
   return (

@@ -168,5 +168,10 @@ export interface EngineCapabilities {
   protocolVersion: number;
   /** Spec capability: whether `session/load` may be used to resume. */
   loadSession: boolean;
+  /** Spec capability (`sessionCapabilities.close`): whether the engine can
+   * release a session's runtime on request. False on engines that predate it,
+   * where eviction still frees this app's copy of the transcript but the
+   * engine keeps the runtime until a re-load supersedes it. */
+  sessionClose: boolean;
   packetcode: PacketcodeCapabilities;
 }

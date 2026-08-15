@@ -65,6 +65,15 @@ export function cancel(sessionId: string): Promise<void> {
   return invoke("engine_cancel", { sessionId });
 }
 
+/** Release a session's engine-side runtime via the spec's `session/close`,
+ * freeing its registries, its transcript, and its MCP child processes.
+ * Idempotent — closing an unknown session is not an error — and engines that
+ * predate the method are silently skipped by the bridge, so this resolves
+ * successfully (having done nothing) against an old engine. */
+export function closeSession(sessionId: string): Promise<void> {
+  return invoke("engine_close_session", { sessionId });
+}
+
 export function listSessions(): Promise<SessionSummary[]> {
   return invoke<SessionSummary[]>("engine_list_sessions");
 }
