@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /d/projects/packetcode-gui && echo \"---PACKETCODE---\" && ls -la /d/projects/packetcode)",
+      "Bash(git clone *)"
+    ]
+  }
+}

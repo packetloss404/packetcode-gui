@@ -1,0 +1,50 @@
+/* Design tokens — mirrored from PacketADE's "Graphite" scheme so the two
+   Packet products share one visual family. Keep names in sync with
+   PacketADE/src/index.css when that file changes. */
+
+:root {
+  --color-bg-primary: #0f0f10;     /* app */
+  --color-bg-secondary: #161617;   /* panels */
+  --color-bg-tertiary: #1c1c1e;    /* elevated */
+  --color-bg-elevated: #232326;    /* hover-quiet */
+  --color-bg-hover: #2a2a2e;       /* pressed */
+  --color-bg-border: #2a2a2e;
+  --color-line-soft: #1f1f22;
+  --color-line-strong: #353539;
+  --color-text-primary: #ededee;
+  --color-text-secondary: #b9b9bd;
+  --color-text-muted: #8a8a91;
+  --color-text-faint: #5e5e66;
+  --color-accent-green: #6fb89a;
+  --color-accent-amber: #d4b25c;
+  --color-accent-blue: #6b9ed9;
+  --color-accent-red: #d96565;
+  --color-accent-purple: #a89ad9;
+  --color-accent-soft: rgba(111, 184, 154, 0.14);
+  --color-accent-line: rgba(111, 184, 154, 0.32);
+
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "Fira Code", Consolas, monospace;
+}
+
+[data-theme="light"] {
+  --color-bg-primary: #ffffff;
+  --color-bg-secondary: #f8f8fc;
+  --color-bg-tertiary: #ededf5;
+  --color-bg-elevated: #e4e4ee;
+  --color-bg-hover: #d8d8e6;
+  --color-bg-border: #d8d8e6;
+  --color-line-soft: #ededf5;
+  --color-line-strong: #c9c9d6;
+  --color-text-primary: #1e1e2e;
+  --color-text-secondary: #5c5c7a;
+  --color-text-muted: #9d9db5;
+  --color-text-faint: #b9b9c8;
+  --color-accent-green: #16825d;
+  --color-accent-amber: #8b7e00;
+  --color-accent-blue: #0060c0;
+  --color-accent-red: #cd3131;
+  --color-accent-purple: #5a6a7e;
+  --color-accent-soft: rgba(22, 130, 93, 0.12);
+  --color-accent-line: rgba(22, 130, 93, 0.30);
+}
