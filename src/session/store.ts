@@ -4,8 +4,8 @@
 // screen. Nothing in this module touches React or Tauri: the reducer is a pure
 // function of (state, action) and can be exercised directly.
 //
-// Two invariants worth stating up front, because the rest of the app leans on
-// them:
+// Three invariants worth stating up front, because the rest of the app leans
+// on them:
 //
 //   * ACP notifications carry only a sessionId, so `byId` is the routing index
 //     from sessionId to slot key. It is populated the moment a slot's session
@@ -23,6 +23,16 @@
 //     reducer sees every dispatch that preceded it, so it cannot make that
 //     mistake — it records the rejection as a pending EFFECT
 //     (`pendingRejects`) that the provider performs and then acknowledges.
+//   * Residency is BOUNDED, not permanent. Every resident session costs the
+//     engine a provider registry, a tool registry, a backup manager, its whole
+//     transcript, and one child process per configured MCP server — so
+//     clicking through fifty history rows used to pin fifty live runtimes for
+//     the engine's lifetime. planEviction below decides who goes;
+//     SessionsProvider does the closing. What eviction must never break is the
+//     property that made permanence safe in the first place: a session that is
+//     running, or that is sitting on an unanswered permission request, stays
+//     reachable. Everything else is recoverable — re-selecting an evicted
+//     session simply loads it again into a fresh slot.
 
 import type {
   ModelOption,
@@ -100,6 +110,11 @@ export interface SessionEntry {
   /** Latest token/cost usage; null until known (fresh session with no turns
    * yet, or an engine without the usage extension). */
   usage: SessionUsage | null;
+  /** Monotonic stamp of when this slot was last the visible one. Only ever
+   * compared, never displayed — it is the recency order eviction works from,
+   * and a slot is stamped on open so a session the user just created is never
+   * the coldest thing in the store. */
+  viewSeq: number;
 }
 
 /** A permission reply the reducer decided on but cannot perform: reducers are
@@ -175,10 +190,17 @@ export type Action =
    * why that is the one failure allowed to close open approval cards. */
   | { type: "cancel_failed"; key: SessionKey; message: string }
   | { type: "rejects_flushed"; tokens: string[] }
-  | { type: "dismiss_notice"; id: string };
+  | { type: "dismiss_notice"; id: string }
+  /** This slot is now the visible one: restamp its recency. */
+  | { type: "touch"; key: SessionKey }
+  /** Drop these slots entirely. The engine-side `session/close` is the
+   * provider's job; the reducer only forgets. */
+  | { type: "evict"; keys: SessionKey[] };
 
 let nextId = 0;
 const genId = () => `t${nextId++}`;
+let nextViewSeq = 0;
+const stampView = () => ++nextViewSeq;
 
 export const initialStore: StoreState = {
   entries: {},
@@ -280,6 +302,53 @@ export function statusById(
   return out;
 }
 
+/** How many IDLE sessions stay resident. Running and attention sessions are
+ * additional and never counted against it — they are not spare capacity, they
+ * are work in progress.
+ *
+ * Five is chosen for the shape of the problem rather than a measurement: the
+ * cost being bounded is per-session engine state (registries, a backup
+ * manager, a whole transcript, one child process per configured MCP server),
+ * and the benefit being preserved is that switching back to something you were
+ * just working in is instant. A working set of five covers the "flip between a
+ * couple of related sessions" pattern with room to spare, while a browse
+ * through fifty history rows settles at six live runtimes instead of fifty.
+ * Overshooting the limit is cheap and re-loading is cheap, so there is no
+ * reason to tune this finely. */
+export const MAX_IDLE_RESIDENT = 5;
+
+/** Which slots should be evicted now, given `activeKey` is the visible one.
+ * Pure, so the policy can be reasoned about (and tested) without a store.
+ *
+ * Never returned, in order of how badly it would hurt:
+ *
+ *   * A session with an unanswered permission request. Its turn is blocked
+ *     inside the engine waiting for an answer only this app can give, and the
+ *     approval card lives in the timeline eviction would throw away.
+ *   * A running session. Its updates would land in `byId` with nowhere to go.
+ *   * The visible slot, whatever its state.
+ *   * A slot whose open is still in flight (not ready, no error yet): dropping
+ *     it would strand the session/new or session/load it is waiting on, which
+ *     is precisely the leak this whole change exists to stop.
+ */
+export function planEviction(
+  state: StoreState,
+  activeKey: SessionKey | null,
+  maxIdle: number = MAX_IDLE_RESIDENT,
+): SessionEntry[] {
+  const idle: SessionEntry[] = [];
+  for (const key of Object.keys(state.entries)) {
+    const entry = getEntry(state, key);
+    if (entry && statusOf(entry) === "idle") idle.push(entry);
+  }
+  // Most recently viewed first. The visible slot was just touched, so it heads
+  // the list and can never be evicted by its own activation.
+  idle.sort((a, b) => b.viewSeq - a.viewSeq);
+  return idle
+    .slice(Math.max(0, maxIdle))
+    .filter((entry) => entry.key !== activeKey && (entry.ready || entry.error !== null));
+}
+
 function patch(
   state: StoreState,
   key: SessionKey,
@@ -310,6 +379,7 @@ export function reduce(state: StoreState, action: Action): StoreState {
         busy: false,
         error: null,
         usage: null,
+        viewSeq: stampView(),
       };
       return {
         ...state,
@@ -372,6 +442,31 @@ export function reduce(state: StoreState, action: Action): StoreState {
     }
     case "usage":
       return patch(state, action.key, (entry) => ({ ...entry, usage: action.usage }));
+    case "touch":
+      return patch(state, action.key, (entry) => ({
+        ...entry,
+        viewSeq: stampView(),
+      }));
+    case "evict": {
+      const entries = { ...state.entries };
+      const byId = { ...state.byId };
+      let dropped = false;
+      for (const key of action.keys) {
+        const entry = getEntry(state, key);
+        if (!entry) continue;
+        dropped = true;
+        delete entries[key];
+        // Only unmap ids this slot still owns: a slot that failed to load has
+        // already had its routing row deleted, and the id may since have been
+        // claimed by a fresh slot that must keep receiving updates.
+        if (entry.sessionId !== null && byId[entry.sessionId] === key) {
+          delete byId[entry.sessionId];
+        }
+      }
+      // No listRevision bump: eviction changes nothing the engine persisted,
+      // so the sidebar's history rows are exactly as they were.
+      return dropped ? { ...state, entries, byId } : state;
+    }
     case "error":
       // Deliberately does NOT settle open approval cards. An error here is a
       // failed prompt or a failed permission reply — the engine never heard

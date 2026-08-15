@@ -37,7 +37,7 @@ if (args[0] === "doctor") {
 if (args[0] !== "acp") {
   process.stderr.write(
     "usage: mock-engine.mjs <doctor --json | acp> [--no-usage] [--no-affordances] " +
-      "[--restricted-caps] [--shutdown-marker=PATH] [--ignore-stdin-close]\n"
+      "[--restricted-caps] [--shutdown-marker=PATH] [--ignore-stdin-close] [--no-close]\n"
   );
   process.exit(2);
 }
@@ -57,6 +57,10 @@ const ignoreStdinClose = args.includes("--ignore-stdin-close");
 // --no-usage simulates an engine predating the _packetcode/sessions/usage
 // extension: the method answers -32601 and prompt results stay bare.
 const noUsage = args.includes("--no-usage");
+// --no-close simulates an engine predating the spec's session/close: the
+// method answers -32601 and initialize advertises no sessionCapabilities.close,
+// so a client evicting a session must degrade instead of failing.
+const noClose = args.includes("--no-close");
 // --no-affordances simulates an engine predating _packetcode/commands/list
 // and _packetcode/project/files: both answer -32601, so the composer's / and
 // @ menus have nothing to offer.
@@ -105,6 +109,11 @@ const awaitingResponse = new Map();
  * session but many sessions at once (internal/acp/server.go keeps per-session
  * state and an `active` flag), so cancel must be scoped by session id. */
 const inflight = new Map();
+/** Sessions the client released with session/close. The real engine deletes
+ * the entry outright, so prompting one afterwards is -32602; tracking them
+ * here is how a test can prove the close actually took effect rather than
+ * being answered and ignored. */
+const closedSessions = new Set();
 
 function update(sessionId, upd) {
   send({
@@ -311,6 +320,8 @@ function handleLine(line) {
             ? {
                 loadSession: true,
                 promptCapabilities: { image: false, audio: false },
+                // Spec shape: "{}" means supported, an absent field means not.
+                sessionCapabilities: noClose ? {} : { close: {} },
                 _packetcode: {
                   sessionsList: true,
                   sessionsRename: false,
@@ -324,7 +335,10 @@ function handleLine(line) {
                   futureExtension: { enabled: true },
                 },
               }
-            : { loadSession: false },
+            : {
+                loadSession: false,
+                sessionCapabilities: noClose ? {} : { close: {} },
+              },
           agentInfo: { name: "mock", version: "0.1.0" },
         },
       });
@@ -334,8 +348,45 @@ function handleLine(line) {
       send({ jsonrpc: "2.0", id, result: { sessionId: `sess-${sessionCounter}` } });
       break;
     case "session/prompt":
+      if (closedSessions.has(params?.sessionId)) {
+        // The real engine deletes the entry on close, so the id is unknown.
+        send({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32602, message: "unknown sessionId" },
+        });
+        break;
+      }
       handlePrompt(id, params);
       break;
+    case "session/close": {
+      if (noClose) {
+        send({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32601, message: `Method not found: ${method}` },
+        });
+        break;
+      }
+      if (typeof params?.sessionId !== "string" || !params.sessionId.trim()) {
+        send({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32602, message: "sessionId is required" },
+        });
+        break;
+      }
+      // Matches the real engine: a busy session is cancelled rather than
+      // rejected, and an unknown one is idempotent success.
+      const running = inflight.get(params.sessionId);
+      if (running) {
+        running.cancelled = true;
+        running.fireCancel(undefined);
+      }
+      closedSessions.add(params.sessionId);
+      send({ jsonrpc: "2.0", id, result: {} });
+      break;
+    }
     case "_packetcode/sessions/usage":
       if (noUsage) {
         send({

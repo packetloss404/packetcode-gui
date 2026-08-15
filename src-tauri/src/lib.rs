@@ -15,6 +15,7 @@ pub fn run() {
             engine::engine_load_session,
             engine::engine_prompt,
             engine::engine_cancel,
+            engine::engine_close_session,
             engine::engine_permission_reply,
             engine::engine_list_sessions,
             engine::engine_rename_session,
