@@ -128,3 +128,32 @@ export interface EngineProbe {
   installSupported: boolean;
   detail?: string;
 }
+
+// What the engine advertised in its ACP `initialize` handshake, retained by
+// the Rust bridge and served by the `engine_capabilities` command. Reading
+// these instead of catching -32601/-32602 at call time is what keeps the UI
+// from offering something the engine will reject.
+export interface PacketcodeCapabilities {
+  /** Whether the engine sent an `agentCapabilities._packetcode` block at all.
+   * False means "the engine did not say" — an older packetcode, or another
+   * ACP agent entirely — and the booleans below carry no information. */
+  advertised: boolean;
+  sessionsList: boolean;
+  sessionsRename: boolean;
+  sessionsUsage: boolean;
+  modelsList: boolean;
+  /** Modes `session/new` accepts, trimmed by the engine to the operator's
+   * permission ceiling. Never empty: engines that advertise nothing yield the
+   * full five-mode vocabulary, so the picker behaves as it always did. */
+  permissionModes: string[];
+  /** Mode a session with no override resolves to; null when not advertised —
+   * the UI must say "engine default" rather than guess a name. */
+  defaultPermissionMode: string | null;
+}
+
+export interface EngineCapabilities {
+  protocolVersion: number;
+  /** Spec capability: whether `session/load` may be used to resume. */
+  loadSession: boolean;
+  packetcode: PacketcodeCapabilities;
+}

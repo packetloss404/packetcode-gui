@@ -216,6 +216,10 @@ export function useSession(
   // Fired after every completed prompt turn, so the shell can refresh the
   // session list.
   onTurnComplete?: () => void,
+  // False only when the engine advertised no `_packetcode/sessions/usage`;
+  // the statusline then skips queries that would answer -32601. Read through
+  // a ref so flipping it never tears down a running session.
+  usageAvailable = true,
 ) {
   const [state, dispatch] = useReducer(reduce, initial);
   const sessionRef = useRef<string | null>(null);
@@ -224,6 +228,8 @@ export function useSession(
   busyRef.current = state.busy;
   const onTurnCompleteRef = useRef(onTurnComplete);
   onTurnCompleteRef.current = onTurnComplete;
+  const usageAvailableRef = useRef(usageAvailable);
+  usageAvailableRef.current = usageAvailable;
   // Monotonic turn counter; guards the usage fallback against stale writes.
   const turnSeqRef = useRef(0);
 
@@ -272,11 +278,13 @@ export function useSession(
           });
           // Resumed sessions may already have spend; hydrate the statusline.
           // Best-effort: old engines answer null, failures stay quiet.
-          void sessionUsage(target.sessionId)
-            .then((usage) => {
-              if (!disposed && usage) dispatch({ type: "usage", usage });
-            })
-            .catch(() => {});
+          if (usageAvailableRef.current) {
+            void sessionUsage(target.sessionId)
+              .then((usage) => {
+                if (!disposed && usage) dispatch({ type: "usage", usage });
+              })
+              .catch(() => {});
+          }
         } else {
           const choice = getModelChoice?.() ?? null;
           const mode = getPermissionMode?.() ?? null;
@@ -329,13 +337,14 @@ export function useSession(
     }
     dispatch({ type: "turn_done" });
     // Newer engines attach usage to the prompt result; otherwise (older
-    // engine, or a cancelled turn) fall back to an explicit query. Both are
-    // best-effort — the statusline just goes stale on failure. The sequence
-    // guard drops a slow fallback response that would otherwise overwrite a
-    // newer turn's enriched usage.
+    // engine, or a cancelled turn) fall back to an explicit query, unless the
+    // engine advertised no usage extension at all. Both are best-effort — the
+    // statusline just goes stale on failure. The sequence guard drops a slow
+    // fallback response that would otherwise overwrite a newer turn's
+    // enriched usage.
     if (outcome?.usage) {
       dispatch({ type: "usage", usage: outcome.usage });
-    } else {
+    } else if (usageAvailableRef.current) {
       const seq = turnSeqRef.current;
       try {
         const usage = await sessionUsage(id);

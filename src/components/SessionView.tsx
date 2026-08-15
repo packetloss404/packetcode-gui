@@ -15,6 +15,12 @@ export function SessionView(props: {
   onModelChoice: (m: ModelOption) => void;
   permissionMode: PermissionMode | null;
   onPermissionMode: (m: PermissionMode) => void;
+  /** Modes the engine will accept; null = it did not say, so offer all. */
+  allowedPermissionModes: string[] | null;
+  /** Mode a session with no override runs under; null = not advertised. */
+  engineDefaultMode: string | null;
+  /** False only when the engine advertised no usage extension. */
+  usageAvailable: boolean;
 }) {
   // Latest picker choices, readable without retriggering session creation.
   const choiceRef = useRef<ModelOption | null>(props.modelChoice);
@@ -30,6 +36,7 @@ export function SessionView(props: {
     getModelChoice,
     getPermissionMode,
     props.onTurnComplete,
+    props.usageAvailable,
   );
   const { onSessionReady } = props;
 
@@ -76,6 +83,8 @@ export function SessionView(props: {
         sessionPermissionMode={state.permissionMode}
         permissionMode={props.permissionMode}
         onPermissionMode={props.onPermissionMode}
+        allowedPermissionModes={props.allowedPermissionModes}
+        engineDefaultMode={props.engineDefaultMode}
         usage={state.usage}
       />
     </section>

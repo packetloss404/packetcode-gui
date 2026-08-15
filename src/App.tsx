@@ -1,7 +1,18 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState } from "react";
-import { listModels, probeEngine, startEngine } from "./acp/client";
+import {
+  allowedPermissionModes,
+  engineDefaultPermissionMode,
+  supports,
+} from "./acp/capabilities";
+import {
+  engineCapabilities,
+  listModels,
+  probeEngine,
+  startEngine,
+} from "./acp/client";
 import type {
+  EngineCapabilities,
   EngineProbe,
   ModelOption,
   PermissionMode,
@@ -29,6 +40,11 @@ type Phase =
 
 export default function App() {
   const [phase, setPhase] = useState<Phase>({ name: "probing" });
+  // What the engine advertised at initialize. Null only if the capability
+  // read itself failed, which every consumer treats as "engine said nothing".
+  const [capabilities, setCapabilities] = useState<EngineCapabilities | null>(
+    null,
+  );
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [target, setTarget] = useState<SessionTarget>({ kind: "new", nonce: 0 });
   // Bumped whenever the persisted session list may have changed (session
@@ -76,8 +92,8 @@ export default function App() {
   const [models, setModels] = useState<ModelOption[]>([]);
   const [modelChoice, setModelChoice] = useState<ModelOption | null>(null);
   const onModelChoice = useCallback((m: ModelOption) => setModelChoice(m), []);
-  // Permission mode for the NEXT session; null = engine default ("ask").
-  // Running sessions keep the policy they were created with.
+  // Permission mode for the NEXT session; null = whatever the engine
+  // resolves to. Running sessions keep the policy they were created with.
   const [permissionMode, setPermissionMode] = useState<PermissionMode | null>(
     null,
   );
@@ -114,12 +130,27 @@ export default function App() {
         setPhase({ name: "incompatible", probe: result });
       } else {
         await startEngine();
-        setPhase({ name: "ready", probe: result });
+        // Read the handshake capabilities BEFORE the shell renders, so the
+        // pickers never briefly offer something the engine would reject.
+        let caps: EngineCapabilities | null = null;
         try {
-          setModels(await listModels());
+          caps = await engineCapabilities();
         } catch {
-          // Older engines have no catalog; the picker just stays inert.
+          // Treated as "the engine advertised nothing": every feature keeps
+          // its call-time fallback, exactly as before capability negotiation.
+        }
+        setCapabilities(caps);
+        setPhase({ name: "ready", probe: result });
+        if (!supports(caps, "modelsList")) {
+          // Advertised absent: skip the round-trip that would answer -32601.
           setModels([]);
+        } else {
+          try {
+            setModels(await listModels());
+          } catch {
+            // Older engines have no catalog; the picker just stays hidden.
+            setModels([]);
+          }
         }
       }
     } catch (e) {
@@ -197,6 +228,7 @@ export default function App() {
         onOpenProject={onOpenProject}
         onSelectProject={onSelectProject}
         onSessionsChanged={bumpSidebar}
+        canRenameSessions={supports(capabilities, "sessionsRename")}
       />
       {sessionCwd === null ? (
         <ProjectGate
@@ -216,6 +248,9 @@ export default function App() {
           onModelChoice={onModelChoice}
           permissionMode={permissionMode}
           onPermissionMode={onPermissionMode}
+          allowedPermissionModes={allowedPermissionModes(capabilities)}
+          engineDefaultMode={engineDefaultPermissionMode(capabilities)}
+          usageAvailable={supports(capabilities, "sessionsUsage")}
         />
       )}
     </div>

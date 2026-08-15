@@ -4,9 +4,9 @@
 //! instead of a Tauri AppHandle; no packetcode binary is required.
 
 use packetcode_gui_lib::engine::{
-    cancel_on, new_session_on, permission_reply_on, prompt_on, rename_session_on,
-    session_usage_on, start_engine, stop_on, AcpEvents, EngineState, PromptOutcome,
-    SessionUsage,
+    cancel_on, capabilities_of, new_session_on, permission_reply_on, prompt_on,
+    rename_session_on, session_usage_on, start_engine, stop_on, AcpEvents, EngineState,
+    PromptOutcome, SessionUsage, PERMISSION_MODES,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -403,6 +403,86 @@ async fn session_usage_is_none_on_engines_without_the_extension() {
     let outcome = timeout(STEP, turn).await.unwrap().unwrap().unwrap();
     assert_eq!(outcome.stop_reason, "end_turn");
     assert_eq!(outcome.usage, None);
+
+    stop_on(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn capabilities_of_engine_without_vendor_block_stay_permissive() {
+    // The default mock advertises no agentCapabilities._packetcode, like an
+    // engine predating capability negotiation. Nothing may be reported as
+    // "advertised" (the call-time -32601 fallbacks still decide), and every
+    // permission mode must stay on offer so the picker does not shrink.
+    let (state, _rx) = start_mock().await;
+    let caps = capabilities_of(&state).await;
+
+    assert!(!caps.packetcode.advertised);
+    assert!(!caps.packetcode.sessions_list);
+    assert!(!caps.packetcode.sessions_rename);
+    assert!(!caps.packetcode.sessions_usage);
+    assert!(!caps.packetcode.models_list);
+    assert_eq!(caps.packetcode.permission_modes, PERMISSION_MODES.to_vec());
+    assert_eq!(caps.packetcode.default_permission_mode, None);
+    assert!(!caps.load_session);
+    assert_eq!(caps.protocol_version, 1);
+
+    // Stopping the engine drops them back to the same conservative state.
+    stop_on(&state).await.unwrap();
+    assert_eq!(capabilities_of(&state).await, Default::default());
+}
+
+#[tokio::test]
+async fn restricted_capabilities_are_surfaced_from_the_handshake() {
+    // --restricted-caps advertises a trimmed permission-mode list and a mix of
+    // extension flags, the shape a real engine sends under an operator
+    // ceiling. The bridge must retain the initialize result rather than
+    // discarding it, so the UI never offers a mode session/new would reject.
+    let (state, _rx) = start_mock_with(&["--restricted-caps"]).await;
+    let caps = capabilities_of(&state).await;
+
+    assert!(caps.packetcode.advertised);
+    assert!(caps.packetcode.sessions_list);
+    assert!(!caps.packetcode.sessions_rename);
+    assert!(caps.packetcode.sessions_usage);
+    assert!(!caps.packetcode.models_list);
+    assert_eq!(
+        caps.packetcode.permission_modes,
+        vec!["ask".to_string(), "read-only".to_string()]
+    );
+    assert_eq!(
+        caps.packetcode.default_permission_mode.as_deref(),
+        Some("read-only")
+    );
+    assert!(caps.load_session);
+
+    // The advertised flags agree with what the engine actually serves: usage
+    // is on, and rename is one of the methods that still answers -32601.
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let usage = timeout(STEP, session_usage_on(&state, &session))
+        .await
+        .expect("usage query timed out")
+        .expect("usage query failed");
+    assert_eq!(usage, Some(mock_usage()));
+
+    stop_on(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn restricted_capabilities_reflect_a_disabled_usage_extension() {
+    // Flags compose: --restricted-caps with --no-usage must advertise
+    // sessionsUsage false AND answer -32601, so the frontend can skip the
+    // query instead of learning from the error.
+    let (state, _rx) = start_mock_with(&["--restricted-caps", "--no-usage"]).await;
+    let caps = capabilities_of(&state).await;
+    assert!(caps.packetcode.advertised);
+    assert!(!caps.packetcode.sessions_usage);
+
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let usage = timeout(STEP, session_usage_on(&state, &session))
+        .await
+        .expect("usage query timed out")
+        .expect("usage query should not error on -32601");
+    assert_eq!(usage, None);
 
     stop_on(&state).await.unwrap();
 }
