@@ -23,6 +23,12 @@ export function newSession(cwd: string): Promise<string> {
   return invoke<string>("engine_new_session", { cwd });
 }
 
+/** Resume a persisted session. Replay updates are emitted on `acp:update`
+ * while this call is in flight — subscribe before invoking. */
+export function loadSession(sessionId: string, cwd: string): Promise<void> {
+  return invoke("engine_load_session", { sessionId, cwd });
+}
+
 export function prompt(sessionId: string, text: string): Promise<StopReason> {
   return invoke<StopReason>("engine_prompt", { sessionId, text });
 }

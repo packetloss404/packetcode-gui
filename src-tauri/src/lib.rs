@@ -9,6 +9,7 @@ pub fn run() {
             engine::engine_probe,
             engine::engine_start,
             engine::engine_new_session,
+            engine::engine_load_session,
             engine::engine_prompt,
             engine::engine_cancel,
             engine::engine_permission_reply,

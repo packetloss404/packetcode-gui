@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { probeEngine, startEngine } from "./acp/client";
-import type { EngineProbe } from "./acp/types";
+import type { EngineProbe, SessionSummary } from "./acp/types";
 import { Gate } from "./components/Gate";
 import { InstallGate } from "./components/InstallGate";
 import { SessionView } from "./components/SessionView";
 import { Sidebar } from "./components/Sidebar";
+import type { SessionTarget } from "./session/useSession";
 
 type Phase =
   | { name: "probing" }
@@ -16,7 +17,27 @@ type Phase =
 export default function App() {
   const [phase, setPhase] = useState<Phase>({ name: "probing" });
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [target, setTarget] = useState<SessionTarget>({ kind: "new" });
   const onSessionReady = useCallback((id: string) => setActiveSessionId(id), []);
+
+  const onSelectSession = useCallback((s: SessionSummary) => {
+    setActiveSessionId(s.sessionId);
+    // Keep the previous target object when re-selecting the same session:
+    // a new object would re-run the session effect without remounting the
+    // view, replaying history into an unreset timeline.
+    setTarget((prev) =>
+      prev.kind === "load" && prev.sessionId === s.sessionId
+        ? prev
+        : { kind: "load", sessionId: s.sessionId, workingDir: s.workingDir },
+    );
+  }, []);
+
+  const onNewSession = useCallback(() => {
+    setActiveSessionId(null);
+    // Same-object reuse as above: already in "new" mode means keep the
+    // current fresh session rather than silently creating another one.
+    setTarget((prev) => (prev.kind === "new" ? prev : { kind: "new" }));
+  }, []);
 
   const probe = useCallback(async () => {
     try {
@@ -78,13 +99,24 @@ export default function App() {
     );
   }
 
+  // Remount the session view when the target changes so its timeline resets
+  // before a resume replay (or a fresh session) fills it.
+  const viewKey = target.kind === "load" ? `load:${target.sessionId}` : "new";
+
   return (
     <div className="shell">
       <Sidebar
         engineVersion={phase.probe.version ?? ""}
         activeSessionId={activeSessionId}
+        onSelectSession={onSelectSession}
+        onNewSession={onNewSession}
       />
-      <SessionView cwd={"."} onSessionReady={onSessionReady} />
+      <SessionView
+        key={viewKey}
+        cwd={"."}
+        target={target}
+        onSessionReady={onSessionReady}
+      />
     </div>
   );
 }

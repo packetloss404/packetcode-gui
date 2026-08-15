@@ -23,8 +23,11 @@ export interface ToolCallContent {
 }
 
 export type SessionUpdate =
-  | { sessionUpdate: "agent_message_chunk"; content: TextBlock }
-  | { sessionUpdate: "agent_thought_chunk"; content: TextBlock }
+  // user_message_chunk arrives only while a session/load replays its stored
+  // transcript; live prompts are echoed locally, not by the engine.
+  | { sessionUpdate: "user_message_chunk"; content: TextBlock; messageId?: string }
+  | { sessionUpdate: "agent_message_chunk"; content: TextBlock; messageId?: string }
+  | { sessionUpdate: "agent_thought_chunk"; content: TextBlock; messageId?: string }
   | { sessionUpdate: "plan"; entries: PlanEntry[] }
   | {
       sessionUpdate: "tool_call";

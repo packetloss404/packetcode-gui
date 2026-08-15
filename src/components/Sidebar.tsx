@@ -19,7 +19,12 @@ function relativeTime(iso: string): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
-export function Sidebar(props: { engineVersion: string; activeSessionId: string | null }) {
+export function Sidebar(props: {
+  engineVersion: string;
+  activeSessionId: string | null;
+  onSelectSession: (session: SessionSummary) => void;
+  onNewSession: () => void;
+}) {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -55,7 +60,9 @@ export function Sidebar(props: { engineVersion: string; activeSessionId: string 
         <b>packetcode</b>
       </div>
       <nav className="nav">
-        <button className="nav-item">+ New session</button>
+        <button className="nav-item" onClick={props.onNewSession}>
+          + New session
+        </button>
         <button className="nav-item">Agents</button>
         <button className="nav-item">Workflows</button>
         <button className="nav-item">Computers</button>
@@ -74,7 +81,8 @@ export function Sidebar(props: { engineVersion: string; activeSessionId: string 
               <button
                 key={s.sessionId}
                 className={active ? "session-row active" : "session-row"}
-                title={`${s.provider} · ${s.model} · ${s.messageCount} messages${active ? "" : " — resume arrives with session/load"}`}
+                title={`${s.provider} · ${s.model} · ${s.messageCount} messages`}
+                onClick={() => props.onSelectSession(s)}
               >
                 <span className={active ? "status-dot running" : "status-dot idle"} />
                 <span className="session-name">{s.name || "untitled"}</span>

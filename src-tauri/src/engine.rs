@@ -22,6 +22,8 @@ use tokio::time::{timeout, Duration};
 pub const MINIMUM_ENGINE_VERSION: &str = "0.1.0";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// `session/load` replays a whole transcript before resolving.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// `session/prompt` runs an entire agent turn; give it room.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
@@ -516,6 +518,41 @@ pub async fn new_session_on(state: &EngineState, cwd: &str) -> Result<String, St
         .and_then(Value::as_str)
         .map(String::from)
         .ok_or_else(|| "session/new returned no sessionId".into())
+}
+
+/// Resumes a persisted session via ACP `session/load`. The engine replays the
+/// stored transcript as `session/update` notifications (forwarded to the
+/// webview as `acp:update`) before this request resolves, so callers must
+/// subscribe to updates before invoking it.
+pub async fn load_session_on(
+    state: &EngineState,
+    session_id: &str,
+    cwd: &str,
+) -> Result<(), String> {
+    let abs = std::fs::canonicalize(cwd)
+        .map_err(|e| format!("cwd {cwd}: {e}"))?
+        .to_string_lossy()
+        .to_string();
+    // Windows canonicalize yields \\?\ paths; the engine wants plain absolutes.
+    let abs = abs.trim_start_matches(r"\\?\").to_string();
+    bridge_of(state)
+        .await?
+        .request(
+            "session/load",
+            json!({ "sessionId": session_id, "cwd": abs, "mcpServers": [] }),
+            LOAD_TIMEOUT,
+        )
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn engine_load_session(
+    session_id: String,
+    cwd: String,
+    state: State<'_, EngineState>,
+) -> Result<(), String> {
+    load_session_on(&state, &session_id, &cwd).await
 }
 
 #[tauri::command]
