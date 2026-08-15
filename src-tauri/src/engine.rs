@@ -86,8 +86,17 @@ pub struct AcpBridge {
     /// the canonical JSON of the request id. The real engine uses STRING ids
     /// ("packetcode-permission-1"), so the raw id Value is stored and echoed
     /// back verbatim in the reply frame.
-    permission_waiters: Mutex<HashMap<String, Value>>,
+    permission_waiters: Mutex<HashMap<String, PendingPermission>>,
     stdin: Mutex<ChildStdin>,
+}
+
+/// One unanswered `session/request_permission`. The session id is kept next to
+/// the raw JSON-RPC id because sessions run concurrently: cancelling one
+/// session must answer only ITS outstanding requests and leave another
+/// session's request waiting for the user.
+struct PendingPermission {
+    session_id: String,
+    raw_id: Value,
 }
 
 impl AcpBridge {
@@ -155,10 +164,18 @@ impl AcpBridge {
                 let Some(rpc_id) = msg.get("id").cloned() else {
                     return;
                 };
-                self.permission_waiters
-                    .lock()
-                    .await
-                    .insert(rpc_id.to_string(), rpc_id.clone());
+                let session_id = msg
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.permission_waiters.lock().await.insert(
+                    rpc_id.to_string(),
+                    PendingPermission {
+                        session_id,
+                        raw_id: rpc_id.clone(),
+                    },
+                );
                 if let Some(params) = msg.get("params") {
                     let mut payload = params.clone();
                     if let Some(obj) = payload.as_object_mut() {
@@ -217,20 +234,27 @@ impl AcpBridge {
             .await
     }
 
-    /// Cancels a session turn: sends `session/cancel` and answers any
-    /// outstanding permission requests with a `cancelled` outcome (the ACP
-    /// contract on cancellation). Late `permission_reply` calls for those
-    /// requests then fail cleanly instead of double-answering the agent.
+    /// Cancels a session turn: sends `session/cancel` and answers THIS
+    /// session's outstanding permission requests with a `cancelled` outcome
+    /// (the ACP contract on cancellation). Late `permission_reply` calls for
+    /// those requests then fail cleanly instead of double-answering the agent.
+    /// Other sessions' requests are left pending — they belong to turns that
+    /// are still running and still need the user's answer.
     pub async fn cancel_session(&self, session_id: &str) -> Result<(), String> {
         self.notify("session/cancel", json!({ "sessionId": session_id }))
             .await?;
-        let stale: Vec<Value> = self
-            .permission_waiters
-            .lock()
-            .await
-            .drain()
-            .map(|(_, raw)| raw)
-            .collect();
+        let stale: Vec<Value> = {
+            let mut waiters = self.permission_waiters.lock().await;
+            let doomed: Vec<String> = waiters
+                .iter()
+                .filter(|(_, pending)| pending.session_id == session_id)
+                .map(|(key, _)| key.clone())
+                .collect();
+            doomed
+                .into_iter()
+                .filter_map(|key| waiters.remove(&key).map(|pending| pending.raw_id))
+                .collect()
+        };
         for id in stale {
             let _ = self
                 .write_line(&json!({
@@ -246,7 +270,7 @@ impl AcpBridge {
     /// Answers a pending agent permission request with the selected option.
     /// `request_id` is the raw JSON-RPC id from the permission event.
     pub async fn permission_reply(&self, request_id: &Value, option_id: &str) -> Result<(), String> {
-        let Some(raw) = self
+        let Some(pending) = self
             .permission_waiters
             .lock()
             .await
@@ -256,7 +280,7 @@ impl AcpBridge {
         };
         self.write_line(&json!({
             "jsonrpc": "2.0",
-            "id": raw,
+            "id": pending.raw_id,
             "result": { "outcome": { "outcome": "selected", "optionId": option_id } }
         }))
         .await

@@ -1,4 +1,4 @@
-import type { TimelineItem } from "../session/useSession";
+import type { TimelineItem } from "../session/store";
 import { Markdown } from "./Markdown";
 
 export function TimelineItemView(props: {

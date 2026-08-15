@@ -57,8 +57,10 @@ const serverRequestId = () => `packetcode-permission-${++nextServerId}`;
 let sessionCounter = 0;
 /** id -> resolve(fn) for agent->client requests awaiting a response */
 const awaitingResponse = new Map();
-/** the single in-flight prompt, or null */
-let inflight = null;
+/** sessionId -> in-flight prompt state. The real engine runs one turn per
+ * session but many sessions at once (internal/acp/server.go keeps per-session
+ * state and an `active` flag), so cancel must be scoped by session id. */
+const inflight = new Map();
 
 function update(sessionId, upd) {
   send({
@@ -99,10 +101,10 @@ async function handlePrompt(id, params) {
   const cancelPromise = new Promise((r) => {
     state.fireCancel = r;
   });
-  inflight = { state };
+  inflight.set(sessionId, state);
 
   const finish = (stopReason) => {
-    inflight = null;
+    inflight.delete(sessionId);
     const result = { stopReason };
     // Match the real engine: only successful turns carry usage enrichment.
     if (!noUsage && stopReason === "end_turn") {
@@ -283,13 +285,16 @@ function handleLine(line) {
       }
       send({ jsonrpc: "2.0", id, result: sessionUsage });
       break;
-    case "session/cancel":
-      // Notification: cancel the in-flight prompt, if any.
-      if (inflight) {
-        inflight.state.cancelled = true;
-        inflight.state.fireCancel(undefined);
+    case "session/cancel": {
+      // Notification: cancel this session's in-flight prompt, if any. Other
+      // sessions' turns keep running.
+      const state = inflight.get(params?.sessionId);
+      if (state) {
+        state.cancelled = true;
+        state.fireCancel(undefined);
       }
       break;
+    }
     default:
       if (id !== undefined) {
         send({

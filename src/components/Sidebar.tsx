@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { listSessions, renameSession } from "../acp/client";
 import type { SessionSummary } from "../acp/types";
 import { isAbsolutePath, pathKey, projectName, samePath } from "../project/projects";
+import type { SessionStatus } from "../session/store";
 
 function relativeTime(iso: string): string {
   const then = Date.parse(iso);
@@ -28,6 +29,9 @@ export function Sidebar(props: {
   /** Bumped by the shell when the persisted list may have changed (turn
    * completed, session created/renamed); triggers a refetch. */
   refreshNonce: number;
+  /** Dot state per RESIDENT session. A session missing from the map has no
+   * runtime in this app — a history row — and shows the idle dot. */
+  sessionStatus: Record<string, SessionStatus | undefined>;
   onSelectSession: (session: SessionSummary) => void;
   onNewSession: () => void;
   onOpenProject: () => void;
@@ -141,13 +145,18 @@ export function Sidebar(props: {
             )}
             {group.sessions.slice(0, 8).map((s) => {
               const active = s.sessionId === props.activeSessionId;
+              // The dot reports the SESSION, not the selection: blue while its
+              // turn runs, amber while it waits on a permission answer the
+              // user has to come back for, grey otherwise.
+              const status = props.sessionStatus[s.sessionId];
+              const dotClass = `status-dot ${status ?? "idle"}`;
               if (editing && editing.id === s.sessionId) {
                 return (
                   <div
                     key={s.sessionId}
                     className={active ? "session-row active" : "session-row"}
                   >
-                    <span className={active ? "status-dot running" : "status-dot idle"} />
+                    <span className={dotClass} />
                     <input
                       className="session-rename"
                       aria-label="Rename session"
@@ -165,15 +174,18 @@ export function Sidebar(props: {
                   </div>
                 );
               }
-              // Renaming the ACTIVE session is disabled: its live runtime
+              // Renaming a RESIDENT session is disabled: its live runtime
               // rewrites the whole session file on the next save, which can
-              // both revert the name and clobber concurrent writes.
-              const canRename = !active;
+              // both revert the name and clobber concurrent writes. Residency,
+              // not selection, is the test now — several sessions are live at
+              // once and only one of them is on screen.
+              const canRename = status === undefined;
+              const attention = status === "attention";
               return (
                 <button
                   key={s.sessionId}
                   className={active ? "session-row active" : "session-row"}
-                  title={`${s.provider} · ${s.model} · ${s.messageCount} messages${canRename ? " — double-click or F2 to rename" : ""}`}
+                  title={`${s.provider} · ${s.model} · ${s.messageCount} messages${attention ? " — waiting for your permission answer" : ""}${canRename ? " — double-click or F2 to rename" : ""}`}
                   onClick={() => props.onSelectSession(s)}
                   onDoubleClick={() => {
                     if (canRename) setEditing({ id: s.sessionId, draft: s.name });
@@ -185,7 +197,7 @@ export function Sidebar(props: {
                     }
                   }}
                 >
-                  <span className={active ? "status-dot running" : "status-dot idle"} />
+                  <span className={dotClass} />
                   <span className="session-name">{s.name || "untitled"}</span>
                   <span className="session-time">{relativeTime(s.updatedAt)}</span>
                 </button>

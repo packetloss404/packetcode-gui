@@ -1,5 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { listModels, probeEngine, startEngine } from "./acp/client";
 import type {
   EngineProbe,
@@ -18,7 +18,8 @@ import {
   rememberProject,
   samePath,
 } from "./project/projects";
-import type { SessionTarget } from "./session/useSession";
+import { SessionsProvider, useSessions } from "./session/SessionsProvider";
+import { getEntry, resolveKey, statusById, type SessionTarget } from "./session/store";
 
 type Phase =
   | { name: "probing" }
@@ -27,18 +28,27 @@ type Phase =
   | { name: "ready"; probe: EngineProbe }
   | { name: "error"; message: string };
 
+/** The store sits above the shell so it outlives every view: switching
+ * sessions unmounts a SessionView, and the session it was showing must keep
+ * streaming into the store. */
 export default function App() {
+  return (
+    <SessionsProvider>
+      <Shell />
+    </SessionsProvider>
+  );
+}
+
+function Shell() {
+  const { state: sessions } = useSessions();
   const [phase, setPhase] = useState<Phase>({ name: "probing" });
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [target, setTarget] = useState<SessionTarget>({ kind: "new", nonce: 0 });
-  // Bumped whenever the persisted session list may have changed (session
-  // created, turn completed, session renamed) so the sidebar refetches live.
-  const [sidebarRefresh, setSidebarRefresh] = useState(0);
-  const bumpSidebar = useCallback(() => setSidebarRefresh((n) => n + 1), []);
-  const onSessionReady = useCallback((id: string) => {
-    setActiveSessionId(id);
-    setSidebarRefresh((n) => n + 1);
-  }, []);
+  // Bumped when the GUI itself changed the persisted list (an inline rename).
+  // Engine-side changes — session created, turn completed, including turns
+  // that finish while their view is unmounted — arrive as store.listRevision,
+  // so no callback has to survive a view switch.
+  const [renameNonce, setRenameNonce] = useState(0);
+  const bumpSidebar = useCallback(() => setRenameNonce((n) => n + 1), []);
   // Selected project directory (absolute path). New sessions are created in
   // it; loaded sessions prefer their own recorded workingDir. Restored from
   // localStorage so relaunching lands back in the last project.
@@ -46,11 +56,11 @@ export default function App() {
   const [recentProjects, setRecentProjects] = useState<string[]>(loadRecentProjects);
 
   // Switching (or re-picking) a project starts a fresh target, exactly like
-  // "+ New session": the next session is created in the new directory.
+  // "+ New session": the next session is created in the new directory. Any
+  // session already running keeps running in the store.
   const activateProject = useCallback((dir: string) => {
     setProjectDir(dir);
     setRecentProjects((recent) => rememberProject(dir, recent));
-    setActiveSessionId(null);
     setTarget({ kind: "new", nonce: Date.now() });
   }, []);
 
@@ -65,7 +75,7 @@ export default function App() {
 
   const onSelectProject = useCallback(
     (dir: string) => {
-      // Re-clicking the active project must not tear down a running session.
+      // Re-clicking the active project must not restart the visible session.
       if (projectDir !== null && samePath(projectDir, dir)) return;
       activateProject(dir);
     },
@@ -87,10 +97,8 @@ export default function App() {
   );
 
   const onSelectSession = useCallback((s: SessionSummary) => {
-    setActiveSessionId(s.sessionId);
-    // Keep the previous target object when re-selecting the same session:
-    // a new object would re-run the session effect without remounting the
-    // view, replaying history into an unreset timeline.
+    // Keep the previous target object when re-selecting the same session so
+    // the view's attach effect does not re-run.
     setTarget((prev) =>
       prev.kind === "load" && prev.sessionId === s.sessionId
         ? prev
@@ -99,9 +107,8 @@ export default function App() {
   }, []);
 
   const onNewSession = useCallback(() => {
-    setActiveSessionId(null);
-    // Every click is a fresh target: a new session is created on remount,
-    // picking up the current model choice.
+    // Every click is a fresh target: a new slot, hence a new session created
+    // with the current model choice, alongside whatever is already running.
     setTarget({ kind: "new", nonce: Date.now() });
   }, []);
 
@@ -130,6 +137,11 @@ export default function App() {
   useEffect(() => {
     void probe();
   }, [probe]);
+
+  // Running / attention / idle per resident session, for the sidebar dots.
+  // Derived from the store, so a background session that stops for a
+  // permission request turns amber wherever the user happens to be.
+  const sessionStatus = useMemo(() => statusById(sessions), [sessions]);
 
   if (phase.name === "probing") {
     return <Gate title="Packetcode" body="Checking for the packetcode engine…" />;
@@ -171,10 +183,14 @@ export default function App() {
     );
   }
 
-  // Remount the session view when the target changes so its timeline resets
-  // before a resume replay (or a fresh session) fills it.
-  const viewKey =
-    target.kind === "load" ? `load:${target.sessionId}` : `new:${target.nonce}`;
+  // The view is remounted per SLOT, not per target: a fresh target is a new
+  // slot (so its timeline starts empty), while re-selecting a session that is
+  // already resident resolves to the slot it already has — no remount, no
+  // reset, and no second session/load.
+  const viewKey = resolveKey(sessions, target);
+  // Which row the sidebar highlights. Derived rather than tracked: a fresh
+  // slot has no id until session/new answers, and then it just appears.
+  const activeSessionId = getEntry(sessions, viewKey)?.sessionId ?? null;
 
   // A load target brings its own recorded workingDir; anything else runs in
   // the selected project. No directory at all means there is nothing safe to
@@ -191,7 +207,8 @@ export default function App() {
         activeSessionId={activeSessionId}
         activeProject={projectDir}
         recentProjects={recentProjects}
-        refreshNonce={sidebarRefresh}
+        refreshNonce={renameNonce + sessions.listRevision}
+        sessionStatus={sessionStatus}
         onSelectSession={onSelectSession}
         onNewSession={onNewSession}
         onOpenProject={onOpenProject}
@@ -209,8 +226,6 @@ export default function App() {
           key={viewKey}
           cwd={sessionCwd}
           target={target}
-          onSessionReady={onSessionReady}
-          onTurnComplete={bumpSidebar}
           models={models}
           modelChoice={modelChoice}
           onModelChoice={onModelChoice}

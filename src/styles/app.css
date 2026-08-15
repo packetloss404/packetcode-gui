@@ -73,10 +73,26 @@ button.project-row:hover { background: var(--color-bg-elevated); }
 .project-mark { color: var(--color-accent-green); font-size: 0.55rem; flex: none; }
 .session-row { padding-left: 26px; font-size: 0.86rem; }
 .session-row.active { background: var(--color-bg-hover); color: var(--color-text-primary); }
+/* Session dots: blue+pulsing while a turn runs, amber while the session waits
+   on a permission answer, grey when it is idle or not live in this app. */
 .status-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
-.status-dot.running { background: var(--color-accent-blue); box-shadow: 0 0 6px var(--color-accent-blue); }
+.status-dot.running {
+  background: var(--color-accent-blue);
+  box-shadow: 0 0 6px var(--color-accent-blue);
+  animation: status-pulse 1.6s ease-in-out infinite;
+}
 .status-dot.idle { background: var(--color-text-faint); }
-.status-dot.attention { background: var(--color-accent-amber); }
+.status-dot.attention {
+  background: var(--color-accent-amber);
+  box-shadow: 0 0 6px var(--color-accent-amber);
+}
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .status-dot.running { animation: none; }
+}
 .session-name {
   flex: 1; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

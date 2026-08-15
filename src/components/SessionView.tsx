@@ -1,41 +1,50 @@
+// A window onto one slot of the session store. The view owns nothing but the
+// composer's local text: mounting it attaches the slot (once), and unmounting
+// it leaves the session running.
+
 import { useCallback, useEffect, useRef } from "react";
 import type { ModelOption, PermissionMode } from "../acp/types";
 import { projectName } from "../project/projects";
-import { useSession, type SessionTarget } from "../session/useSession";
+import { useSessions } from "../session/SessionsProvider";
+import { getEntry, resolveKey, type SessionTarget } from "../session/store";
 import { Composer } from "./Composer";
 import { TimelineItemView } from "./TimelineItemView";
 
 export function SessionView(props: {
   cwd: string;
   target: SessionTarget;
-  onSessionReady: (id: string) => void;
-  onTurnComplete?: () => void;
   models: ModelOption[];
   modelChoice: ModelOption | null;
   onModelChoice: (m: ModelOption) => void;
   permissionMode: PermissionMode | null;
   onPermissionMode: (m: PermissionMode) => void;
 }) {
-  // Latest picker choices, readable without retriggering session creation.
+  const { state, open, send, stop, answerPermission } = useSessions();
+  // Latest picker choices, readable without retriggering session creation:
+  // changing a picker must never tear down or re-create a live session — the
+  // choices only apply to the next session opened.
   const choiceRef = useRef<ModelOption | null>(props.modelChoice);
   choiceRef.current = props.modelChoice;
-  const getModelChoice = useCallback(() => choiceRef.current, []);
   const modeRef = useRef<PermissionMode | null>(props.permissionMode);
   modeRef.current = props.permissionMode;
-  const getPermissionMode = useCallback(() => modeRef.current, []);
 
-  const { state, send, stop, answerPermission } = useSession(
-    props.cwd,
-    props.target,
-    getModelChoice,
-    getPermissionMode,
-    props.onTurnComplete,
-  );
-  const { onSessionReady } = props;
+  const key = resolveKey(state, props.target);
+  const entry = getEntry(state, key);
+  const { cwd, target } = props;
 
   useEffect(() => {
-    if (state.sessionId) onSessionReady(state.sessionId);
-  }, [state.sessionId, onSessionReady]);
+    // Idempotent per slot: re-entering a session already in the store does not
+    // re-issue session/load, which would replay its transcript a second time.
+    open(key, target, cwd, choiceRef.current, modeRef.current);
+  }, [open, key, target, cwd]);
+
+  const onSend = useCallback((text: string) => send(key, text), [send, key]);
+  const onStop = useCallback(() => stop(key), [stop, key]);
+  const onPermission = useCallback(
+    (requestId: string | number, optionId: string) =>
+      answerPermission(key, requestId, optionId),
+    [answerPermission, key],
+  );
 
   const shownCwd =
     props.target.kind === "load" && props.target.workingDir
@@ -52,31 +61,31 @@ export function SessionView(props: {
       </header>
       <div className="chat">
         <div className="flow selectable">
-          {state.timeline.map((item) => (
+          {(entry?.timeline ?? []).map((item) => (
             <TimelineItemView
               key={item.id}
               item={item}
-              onPermission={answerPermission}
+              onPermission={onPermission}
             />
           ))}
-          {state.error ? (
-            <div className="thought">engine error: {state.error}</div>
+          {entry?.error ? (
+            <div className="thought">engine error: {entry.error}</div>
           ) : null}
         </div>
       </div>
       <Composer
-        busy={state.busy}
-        onSend={send}
-        onStop={stop}
+        busy={entry?.busy ?? false}
+        onSend={onSend}
+        onStop={onStop}
         models={props.models}
-        sessionModel={state.model}
+        sessionModel={entry?.model ?? null}
         modelChoice={props.modelChoice}
         onModelChoice={props.onModelChoice}
         projectDir={shownCwd}
-        sessionPermissionMode={state.permissionMode}
+        sessionPermissionMode={entry?.permissionMode ?? null}
         permissionMode={props.permissionMode}
         onPermissionMode={props.onPermissionMode}
-        usage={state.usage}
+        usage={entry?.usage ?? null}
       />
     </section>
   );

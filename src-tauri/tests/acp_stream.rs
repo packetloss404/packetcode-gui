@@ -430,3 +430,67 @@ async fn engine_death_fails_pending_prompt_promptly() {
         "unexpected error after engine death: {err}"
     );
 }
+
+#[tokio::test]
+async fn concurrent_sessions_stream_independently_and_cancel_is_scoped() {
+    // The premise the GUI's concurrent-sessions model rests on: one connection
+    // carries two live turns at once, and cancelling one must not disturb the
+    // other — including the other's UNANSWERED permission request, which the
+    // user may still be on their way back to answer.
+    let (state, mut rx) = start_mock().await;
+    let a = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let b = new_session_on(&state, ".", None, None, None).await.unwrap();
+    assert_ne!(a, b);
+
+    let turn_a = spawn_prompt(&state, &a, "slow demo");
+    let turn_b = spawn_prompt(&state, &b, "slow demo");
+
+    // Both turns progress interleaved on the one transport until each blocks
+    // on its own permission request.
+    let mut perm_a: Option<Value> = None;
+    let mut perm_b: Option<Value> = None;
+    while perm_a.is_none() || perm_b.is_none() {
+        if let Event::Permission(payload) = next_event(&mut rx).await {
+            let session = payload
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if session == a {
+                perm_a = Some(payload);
+            } else if session == b {
+                perm_b = Some(payload);
+            } else {
+                panic!("permission for an unknown session {session}");
+            }
+        }
+    }
+    let id_a = permission_request_id(&perm_a.expect("permission for session a"));
+    let id_b = permission_request_id(&perm_b.expect("permission for session b"));
+    assert_ne!(id_a, id_b);
+
+    // Cancel A only.
+    timeout(STEP, cancel_on(&state, &a))
+        .await
+        .expect("cancel deadlocked")
+        .expect("cancel failed");
+    let outcome_a = timeout(STEP, turn_a).await.unwrap().unwrap().unwrap();
+    assert_eq!(outcome_a.stop_reason, "cancelled");
+    // A's request was answered "cancelled" on our side; a late reply fails.
+    let err = permission_reply_on(&state, &id_a, "allow_once")
+        .await
+        .expect_err("late reply to the cancelled session should fail");
+    assert!(err.contains("no pending permission request"), "got: {err}");
+
+    // B was never touched: its request is still pending and still answerable,
+    // and answering it carries the turn to completion.
+    timeout(STEP, permission_reply_on(&state, &id_b, "allow_once"))
+        .await
+        .expect("reply to the untouched session deadlocked")
+        .expect("reply to the untouched session was dropped by the cancel");
+    let outcome_b = timeout(STEP, turn_b).await.unwrap().unwrap().unwrap();
+    assert_eq!(outcome_b.stop_reason, "end_turn");
+    assert_eq!(outcome_b.usage, Some(mock_usage()));
+
+    stop_on(&state).await.unwrap();
+}
