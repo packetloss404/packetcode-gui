@@ -8,6 +8,7 @@ export function SessionView(props: {
   cwd: string;
   target: SessionTarget;
   onSessionReady: (id: string) => void;
+  onTurnComplete?: () => void;
   models: ModelOption[];
   modelChoice: ModelOption | null;
   onModelChoice: (m: ModelOption) => void;
@@ -21,6 +22,7 @@ export function SessionView(props: {
     props.cwd,
     props.target,
     getModelChoice,
+    props.onTurnComplete,
   );
   const { onSessionReady } = props;
 

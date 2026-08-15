@@ -698,6 +698,38 @@ pub async fn engine_list_sessions(
     }
 }
 
+/// Renames a persisted session via the engine's `_packetcode/sessions/rename`
+/// ACP extension. Engines that predate the extension answer method-not-found;
+/// that is silently ignored — titles then simply stay engine-generated.
+pub async fn rename_session_on(
+    state: &EngineState,
+    session_id: &str,
+    name: &str,
+) -> Result<(), String> {
+    let response = bridge_of(state)
+        .await?
+        .request(
+            "_packetcode/sessions/rename",
+            json!({ "sessionId": session_id, "name": name }),
+            REQUEST_TIMEOUT,
+        )
+        .await;
+    match response {
+        Ok(_) => Ok(()),
+        Err(err) if err.contains("-32601") || err.contains("Method not found") => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[tauri::command]
+pub async fn engine_rename_session(
+    session_id: String,
+    name: String,
+    state: State<'_, EngineState>,
+) -> Result<(), String> {
+    rename_session_on(&state, &session_id, &name).await
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelOption {

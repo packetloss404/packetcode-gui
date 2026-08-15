@@ -18,7 +18,14 @@ export default function App() {
   const [phase, setPhase] = useState<Phase>({ name: "probing" });
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [target, setTarget] = useState<SessionTarget>({ kind: "new", nonce: 0 });
-  const onSessionReady = useCallback((id: string) => setActiveSessionId(id), []);
+  // Bumped whenever the persisted session list may have changed (session
+  // created, turn completed, session renamed) so the sidebar refetches live.
+  const [sidebarRefresh, setSidebarRefresh] = useState(0);
+  const bumpSidebar = useCallback(() => setSidebarRefresh((n) => n + 1), []);
+  const onSessionReady = useCallback((id: string) => {
+    setActiveSessionId(id);
+    setSidebarRefresh((n) => n + 1);
+  }, []);
   // Provider/model catalog from the engine, and the user's picker choice.
   // The choice applies to the NEXT session; running sessions keep theirs.
   const [models, setModels] = useState<ModelOption[]>([]);
@@ -120,14 +127,17 @@ export default function App() {
       <Sidebar
         engineVersion={phase.probe.version ?? ""}
         activeSessionId={activeSessionId}
+        refreshNonce={sidebarRefresh}
         onSelectSession={onSelectSession}
         onNewSession={onNewSession}
+        onSessionsChanged={bumpSidebar}
       />
       <SessionView
         key={viewKey}
         cwd={"."}
         target={target}
         onSessionReady={onSessionReady}
+        onTurnComplete={bumpSidebar}
         models={models}
         modelChoice={modelChoice}
         onModelChoice={onModelChoice}

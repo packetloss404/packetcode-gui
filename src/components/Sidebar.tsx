@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { listSessions } from "../acp/client";
+import { listSessions, renameSession } from "../acp/client";
 import type { SessionSummary } from "../acp/types";
 
 function projectName(workingDir: string): string {
@@ -22,17 +22,29 @@ function relativeTime(iso: string): string {
 export function Sidebar(props: {
   engineVersion: string;
   activeSessionId: string | null;
+  /** Bumped by the shell when the persisted list may have changed (turn
+   * completed, session created/renamed); triggers a refetch. */
+  refreshNonce: number;
   onSelectSession: (session: SessionSummary) => void;
   onNewSession: () => void;
+  /** Tell the shell the list changed (e.g. after an inline rename). */
+  onSessionsChanged: () => void;
 }) {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Inline rename state: the row being edited and its draft text.
+  const [editing, setEditing] = useState<{ id: string; draft: string } | null>(
+    null,
+  );
 
   useEffect(() => {
     let disposed = false;
     listSessions()
       .then((list) => {
-        if (!disposed) setSessions(list);
+        if (!disposed) {
+          setSessions(list);
+          setError(null);
+        }
       })
       .catch((e) => {
         if (!disposed) setError(String(e));
@@ -40,7 +52,23 @@ export function Sidebar(props: {
     return () => {
       disposed = true;
     };
-  }, [props.activeSessionId]);
+  }, [props.activeSessionId, props.refreshNonce]);
+
+  const commitRename = async () => {
+    if (!editing) return;
+    const { id, draft } = editing;
+    setEditing(null);
+    const name = draft.trim();
+    const previous = sessions.find((s) => s.sessionId === id)?.name ?? "";
+    if (!name || name === previous) return;
+    try {
+      await renameSession(id, name);
+    } catch {
+      // Cosmetic failure (engine too old, session gone); the refetch below
+      // shows whatever the engine actually has.
+    }
+    props.onSessionsChanged();
+  };
 
   const projects = useMemo(() => {
     const groups = new Map<string, SessionSummary[]>();
@@ -77,12 +105,45 @@ export function Sidebar(props: {
           <div className="project-row">{name}</div>
           {list.slice(0, 8).map((s) => {
             const active = s.sessionId === props.activeSessionId;
+            if (editing && editing.id === s.sessionId) {
+              return (
+                <div
+                  key={s.sessionId}
+                  className={active ? "session-row active" : "session-row"}
+                >
+                  <span className={active ? "status-dot running" : "status-dot idle"} />
+                  <input
+                    className="session-rename"
+                    aria-label="Rename session"
+                    autoFocus
+                    value={editing.draft}
+                    onChange={(e) =>
+                      setEditing({ id: s.sessionId, draft: e.target.value })
+                    }
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void commitRename();
+                      else if (e.key === "Escape") setEditing(null);
+                    }}
+                    onBlur={() => setEditing(null)}
+                  />
+                </div>
+              );
+            }
             return (
               <button
                 key={s.sessionId}
                 className={active ? "session-row active" : "session-row"}
-                title={`${s.provider} · ${s.model} · ${s.messageCount} messages`}
+                title={`${s.provider} · ${s.model} · ${s.messageCount} messages — double-click or F2 to rename`}
                 onClick={() => props.onSelectSession(s)}
+                onDoubleClick={() =>
+                  setEditing({ id: s.sessionId, draft: s.name })
+                }
+                onKeyDown={(e) => {
+                  if (e.key === "F2") {
+                    e.preventDefault();
+                    setEditing({ id: s.sessionId, draft: s.name });
+                  }
+                }}
               >
                 <span className={active ? "status-dot running" : "status-dot idle"} />
                 <span className="session-name">{s.name || "untitled"}</span>

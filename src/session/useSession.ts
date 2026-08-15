@@ -9,6 +9,7 @@ import {
   onPermissionRequest,
   onSessionUpdate,
   prompt,
+  renameSession,
   replyPermission,
 } from "../acp/client";
 import type {
@@ -64,6 +65,21 @@ type Action =
 
 let nextId = 0;
 const genId = () => `t${nextId++}`;
+
+/** Session title from a prompt: its first non-empty line, capped at ~48
+ * characters with a word-boundary truncation when one falls in the back
+ * half of the window. */
+export function deriveSessionTitle(text: string): string {
+  const line =
+    text
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => l.length > 0) ?? "";
+  if (line.length <= 48) return line;
+  const cut = line.slice(0, 48);
+  const space = cut.lastIndexOf(" ");
+  return (space > 24 ? cut.slice(0, space) : cut).trimEnd();
+}
 
 const initial: SessionState = {
   sessionId: null,
@@ -189,12 +205,20 @@ export function useSession(
   // changing the picker never tears down the running session — the choice
   // only applies to the next session this hook creates.
   getModelChoice?: () => ModelOption | null,
+  // Fired after every completed prompt turn (and after the auto-title
+  // rename, when one runs), so the shell can refresh the session list.
+  onTurnComplete?: () => void,
 ) {
   const [state, dispatch] = useReducer(reduce, initial);
   const sessionRef = useRef<string | null>(null);
   sessionRef.current = state.sessionId;
   const busyRef = useRef(false);
   busyRef.current = state.busy;
+  const onTurnCompleteRef = useRef(onTurnComplete);
+  onTurnCompleteRef.current = onTurnComplete;
+  // Auto-title fires only on the FIRST prompt of a fresh session; resumed
+  // sessions already carry a name derived from their own first prompt.
+  const autoTitleRef = useRef(target.kind === "new");
 
   useEffect(() => {
     let disposed = false;
@@ -260,6 +284,8 @@ export function useSession(
   const send = useCallback(async (text: string) => {
     const id = sessionRef.current;
     if (!id) return;
+    const firstPrompt = autoTitleRef.current;
+    autoTitleRef.current = false;
     dispatch({ type: "user_prompt", text });
     try {
       await prompt(id, text);
@@ -268,6 +294,17 @@ export function useSession(
       return;
     }
     dispatch({ type: "turn_done" });
+    if (firstPrompt) {
+      const title = deriveSessionTitle(text);
+      if (title) {
+        try {
+          await renameSession(id, title);
+        } catch {
+          // Rename is cosmetic; a failure must never break the turn flow.
+        }
+      }
+    }
+    onTurnCompleteRef.current?.();
   }, []);
 
   const stop = useCallback(() => {

@@ -4,8 +4,8 @@
 //! instead of a Tauri AppHandle; no packetcode binary is required.
 
 use packetcode_gui_lib::engine::{
-    cancel_on, new_session_on, permission_reply_on, prompt_on, start_engine, stop_on, AcpEvents,
-    EngineState,
+    cancel_on, new_session_on, permission_reply_on, prompt_on, rename_session_on, start_engine,
+    stop_on, AcpEvents, EngineState,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -327,6 +327,20 @@ async fn malformed_and_interleaved_lines_do_not_wedge_the_reader() {
     let session2 = new_session_on(&state, ".", None, None).await.unwrap();
     assert!(session2.starts_with("sess-"));
 
+    stop_on(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn rename_on_engine_without_extension_is_silently_skipped() {
+    // The mock engine answers -32601 for `_packetcode/sessions/rename`, the
+    // same as a real engine that predates the extension. The bridge must treat
+    // that as success so auto-titling never surfaces errors on old engines.
+    let (state, _rx) = start_mock().await;
+    let session = new_session_on(&state, ".", None, None).await.unwrap();
+    timeout(STEP, rename_session_on(&state, &session, "My first prompt"))
+        .await
+        .expect("rename timed out")
+        .expect("rename against an old engine should silently succeed");
     stop_on(&state).await.unwrap();
 }
 

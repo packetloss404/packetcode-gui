@@ -50,6 +50,13 @@ export function listSessions(): Promise<SessionSummary[]> {
   return invoke<SessionSummary[]>("engine_list_sessions");
 }
 
+/** Retitle a persisted session via `_packetcode/sessions/rename`. Engines
+ * that predate the extension are silently skipped by the bridge, so this
+ * resolves successfully without renaming on old engines. */
+export function renameSession(sessionId: string, name: string): Promise<void> {
+  return invoke("engine_rename_session", { sessionId, name });
+}
+
 export function listModels(): Promise<ModelOption[]> {
   return invoke<ModelOption[]>("engine_list_models");
 }
