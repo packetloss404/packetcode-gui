@@ -80,6 +80,19 @@ pub struct PacketcodeCapabilities {
     pub sessions_usage: bool,
     /// Gates `_packetcode/models/list`.
     pub models_list: bool,
+    /// Gates the CONFIGURED half of `_packetcode/mcp/list` — the query with no
+    /// session id, which reports the `[mcp.<name>]` servers the engine would
+    /// start for a session that inherits them. That list is what the consent
+    /// disclosure shows, so without this flag there is nothing to disclose.
+    pub mcp_list: bool,
+    /// A wire-behaviour promise, not a feature toggle: this engine reads an
+    /// OMITTED `mcpServers` on session/new and session/load as "use your own
+    /// configured servers". Omitting is the ONLY way to ask for them, since
+    /// `[]` means "no MCP servers at all" on every engine — and engines that
+    /// never made this promise reject the omission with invalid-params. So
+    /// unlike the other flags this one is never assumed: false means the
+    /// client must keep sending `[]`, with no call-time fallback available.
+    pub mcp_defaults: bool,
     /// Modes `session/new` will accept. The engine trims this to the
     /// operator's configured ceiling; anything above it fails -32602, so the
     /// picker must offer exactly this set. Never empty: an engine that
@@ -98,6 +111,8 @@ impl Default for PacketcodeCapabilities {
             sessions_rename: false,
             sessions_usage: false,
             models_list: false,
+            mcp_list: false,
+            mcp_defaults: false,
             permission_modes: PERMISSION_MODES.iter().map(|m| m.to_string()).collect(),
             default_permission_mode: None,
         }
@@ -175,6 +190,8 @@ fn parse_capabilities(result: &Value) -> EngineCapabilities {
             sessions_rename: flag("sessionsRename"),
             sessions_usage: flag("sessionsUsage"),
             models_list: flag("modelsList"),
+            mcp_list: flag("mcpList"),
+            mcp_defaults: flag("mcpDefaults"),
             permission_modes,
             default_permission_mode,
         },
@@ -688,6 +705,26 @@ async fn bridge_of(state: &EngineState) -> Result<Arc<AcpBridge>, String> {
         .ok_or_else(|| "engine not started".to_string())
 }
 
+/// The `mcpServers` field for session/new and session/load, or `None` to
+/// leave it out.
+///
+/// ACP has no "no preference" value here: `[]` is a positive instruction to
+/// run the session with NO MCP servers, and a populated list means "exactly
+/// these". Only the field's ABSENCE asks a capable engine for its own
+/// configured fleet — the `[mcp.<name>]` blocks in the user's config.toml.
+///
+/// Absence therefore starts local subprocesses that this app never launched
+/// itself, which is why `inherit` is a decision carried in from the frontend
+/// (a stored, reversible consent) rather than a default. It is intersected
+/// with the engine's `mcpDefaults` promise before it reaches here.
+fn mcp_servers_param(inherit: bool) -> Option<Value> {
+    if inherit {
+        None
+    } else {
+        Some(json!([]))
+    }
+}
+
 /// Builds the `session/new` params object. Optional per-session provider,
 /// model, and permission-mode overrides ride in the engine's "_packetcode"
 /// vendor-extension params object. The extension is omitted entirely when the
@@ -698,8 +735,15 @@ fn new_session_params(
     provider: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    inherit_mcp: bool,
 ) -> Value {
-    let mut params = json!({ "cwd": cwd_abs, "mcpServers": [] });
+    let mut params = json!({ "cwd": cwd_abs });
+    if let Some(servers) = mcp_servers_param(inherit_mcp) {
+        params
+            .as_object_mut()
+            .expect("session/new params are an object")
+            .insert("mcpServers".into(), servers);
+    }
     let provider = provider
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
@@ -726,12 +770,21 @@ fn new_session_params(
     params
 }
 
+/// Whether this session may inherit the engine's configured MCP servers: the
+/// user asked for it AND the engine promised it understands the omission.
+/// Both halves are required — asking an engine that never advertised
+/// `mcpDefaults` fails the entire session/new with invalid-params.
+async fn may_inherit_mcp(state: &EngineState, requested: bool) -> bool {
+    requested && capabilities_of(state).await.packetcode.mcp_defaults
+}
+
 pub async fn new_session_on(
     state: &EngineState,
     cwd: &str,
     provider: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    inherit_mcp: bool,
 ) -> Result<String, String> {
     let abs = std::fs::canonicalize(cwd)
         .map_err(|e| format!("cwd {cwd}: {e}"))?
@@ -739,7 +792,8 @@ pub async fn new_session_on(
         .to_string();
     // Windows canonicalize yields \\?\ paths; the engine wants plain absolutes.
     let abs = abs.trim_start_matches(r"\\?\").to_string();
-    let params = new_session_params(&abs, provider, model, permission_mode);
+    let inherit = may_inherit_mcp(state, inherit_mcp).await;
+    let params = new_session_params(&abs, provider, model, permission_mode, inherit);
     let result = bridge_of(state)
         .await?
         .request("session/new", params, REQUEST_TIMEOUT)
@@ -755,10 +809,25 @@ pub async fn new_session_on(
 /// stored transcript as `session/update` notifications (forwarded to the
 /// webview as `acp:update`) before this request resolves, so callers must
 /// subscribe to updates before invoking it.
+/// `session/load` params. Same MCP contract as session/new: a resumed session
+/// inherits the engine's configured servers only when the user consented,
+/// otherwise it runs with none.
+fn load_session_params(session_id: &str, cwd_abs: &str, inherit_mcp: bool) -> Value {
+    let mut params = json!({ "sessionId": session_id, "cwd": cwd_abs });
+    if let Some(servers) = mcp_servers_param(inherit_mcp) {
+        params
+            .as_object_mut()
+            .expect("session/load params are an object")
+            .insert("mcpServers".into(), servers);
+    }
+    params
+}
+
 pub async fn load_session_on(
     state: &EngineState,
     session_id: &str,
     cwd: &str,
+    inherit_mcp: bool,
 ) -> Result<(), String> {
     let abs = std::fs::canonicalize(cwd)
         .map_err(|e| format!("cwd {cwd}: {e}"))?
@@ -766,11 +835,12 @@ pub async fn load_session_on(
         .to_string();
     // Windows canonicalize yields \\?\ paths; the engine wants plain absolutes.
     let abs = abs.trim_start_matches(r"\\?\").to_string();
+    let inherit = may_inherit_mcp(state, inherit_mcp).await;
     bridge_of(state)
         .await?
         .request(
             "session/load",
-            json!({ "sessionId": session_id, "cwd": abs, "mcpServers": [] }),
+            load_session_params(session_id, &abs, inherit),
             LOAD_TIMEOUT,
         )
         .await?;
@@ -781,9 +851,10 @@ pub async fn load_session_on(
 pub async fn engine_load_session(
     session_id: String,
     cwd: String,
+    inherit_mcp: bool,
     state: State<'_, EngineState>,
 ) -> Result<(), String> {
-    load_session_on(&state, &session_id, &cwd).await
+    load_session_on(&state, &session_id, &cwd, inherit_mcp).await
 }
 
 #[tauri::command]
@@ -792,9 +863,10 @@ pub async fn engine_new_session(
     provider: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    inherit_mcp: bool,
     state: State<'_, EngineState>,
 ) -> Result<String, String> {
-    new_session_on(&state, &cwd, provider, model, permission_mode).await
+    new_session_on(&state, &cwd, provider, model, permission_mode, inherit_mcp).await
 }
 
 /// Per-session token/cost usage, as served by the engine's
@@ -1027,6 +1099,70 @@ pub async fn engine_list_models(
         Err(err) if is_method_not_found(&err) => Ok(Vec::new()),
         Err(err) => Err(err),
     }
+}
+
+/// One MCP server as reported by the engine's `_packetcode/mcp/list`
+/// extension. Fields are additive on the wire; unknown ones are ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerStatus {
+    pub name: String,
+    /// "running", "failed", "disabled" (configured with `enabled = false`),
+    /// or "configured" (known from configuration, not started in this scope).
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub tool_count: u32,
+    /// "agent" for the engine's own configuration, "client" for servers an
+    /// ACP client supplied. This client never supplies any of its own.
+    #[serde(default)]
+    pub source: String,
+    /// The executable the engine would run. Load-bearing for disclosure: this
+    /// is the arbitrary local subprocess the user is being asked about.
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub error: String,
+}
+
+/// MCP servers via the engine's `_packetcode/mcp/list` extension.
+///
+/// With a session id: that session's LIVE fleet — what actually started, with
+/// tool counts and startup errors. Without one: the engine's CONFIGURED
+/// servers, which is what a session that inherits them would start. The
+/// second form is the disclosure surface — it can be read before any session
+/// exists, so the user sees the command list before anything is spawned.
+///
+/// Engines predating the extension answer method-not-found, which degrades to
+/// an empty list rather than an error: nothing to show, no failure to report.
+pub async fn list_mcp_servers_on(
+    state: &EngineState,
+    session_id: Option<&str>,
+) -> Result<Vec<McpServerStatus>, String> {
+    let params = match session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => json!({ "sessionId": id }),
+        None => json!({}),
+    };
+    let response = bridge_of(state)
+        .await?
+        .request("_packetcode/mcp/list", params, REQUEST_TIMEOUT)
+        .await;
+    match response {
+        Ok(result) => {
+            let servers = result.get("servers").cloned().unwrap_or(json!([]));
+            serde_json::from_value(servers).map_err(|e| format!("bad MCP payload: {e}"))
+        }
+        Err(err) if is_method_not_found(&err) => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+#[tauri::command]
+pub async fn engine_list_mcp_servers(
+    session_id: Option<String>,
+    state: State<'_, EngineState>,
+) -> Result<Vec<McpServerStatus>, String> {
+    list_mcp_servers_on(&state, session_id.as_deref()).await
 }
 
 /// One invocable slash command from the engine's `_packetcode/commands/list`
@@ -1324,8 +1460,8 @@ pub async fn engine_stop(state: State<'_, EngineState>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        new_session_params, parse_capabilities, version_at_least, PacketcodeCapabilities,
-        PERMISSION_MODES,
+        load_session_params, new_session_params, parse_capabilities, version_at_least,
+        PacketcodeCapabilities, PERMISSION_MODES,
     };
     use serde_json::{json, Value};
 
@@ -1346,11 +1482,32 @@ mod tests {
 
     #[test]
     fn session_params_omit_extension_when_unset() {
-        let params = new_session_params("/w", None, None, None);
+        let params = new_session_params("/w", None, None, None, false);
         assert_eq!(params, json!({ "cwd": "/w", "mcpServers": [] }));
         // Blank-only overrides are treated as unset.
-        let params = new_session_params("/w", Some("  ".into()), None, Some("".into()));
+        let params = new_session_params("/w", Some("  ".into()), None, Some("".into()), false);
         assert_eq!(params, json!({ "cwd": "/w", "mcpServers": [] }));
+    }
+
+    /// The default is the safe one: without consent the session carries an
+    /// explicit empty list, so no `[mcp.<name>]` subprocess is started. Only
+    /// an opted-in session omits the field, which is the sole way to ask a
+    /// capable engine for its own fleet.
+    #[test]
+    fn session_params_only_omit_mcp_servers_when_inheriting() {
+        let params = new_session_params("/w", None, None, None, true);
+        assert_eq!(params, json!({ "cwd": "/w" }));
+        assert!(params.get("mcpServers").is_none());
+
+        let params = load_session_params("s-1", "/w", true);
+        assert_eq!(params, json!({ "sessionId": "s-1", "cwd": "/w" }));
+
+        // Resuming without consent must not quietly inherit either.
+        let params = load_session_params("s-1", "/w", false);
+        assert_eq!(
+            params,
+            json!({ "sessionId": "s-1", "cwd": "/w", "mcpServers": [] })
+        );
     }
 
     #[test]
@@ -1360,6 +1517,7 @@ mod tests {
             Some("anthropic".into()),
             Some("claude-fable-5".into()),
             Some("accept-edits".into()),
+            false,
         );
         assert_eq!(
             params["_packetcode"],
@@ -1370,7 +1528,7 @@ mod tests {
             })
         );
         // A mode alone still rides the extension object.
-        let params = new_session_params("/w", None, None, Some("bypass".into()));
+        let params = new_session_params("/w", None, None, Some("bypass".into()), false);
         assert_eq!(params["_packetcode"], json!({ "permissionMode": "bypass" }));
     }
 
@@ -1391,6 +1549,8 @@ mod tests {
                     "sessionsRename": true,
                     "sessionsUsage": true,
                     "modelsList": false,
+                    "mcpList": true,
+                    "mcpDefaults": true,
                     "permissionModes": ["ask", "read-only"],
                     "defaultPermissionMode": "read-only",
                     "somethingNewerThanThisClient": 7
@@ -1406,6 +1566,8 @@ mod tests {
         assert!(caps.packetcode.sessions_rename);
         assert!(caps.packetcode.sessions_usage);
         assert!(!caps.packetcode.models_list);
+        assert!(caps.packetcode.mcp_list);
+        assert!(caps.packetcode.mcp_defaults);
         assert_eq!(caps.packetcode.permission_modes, modes(&["ask", "read-only"]));
         assert_eq!(
             caps.packetcode.default_permission_mode.as_deref(),
@@ -1429,6 +1591,10 @@ mod tests {
         assert!(!caps.packetcode.sessions_rename);
         assert!(!caps.packetcode.sessions_usage);
         assert!(!caps.packetcode.models_list);
+        // No promise, no omission: the client must keep sending mcpServers: []
+        // to this engine, so it can never inherit a configured fleet.
+        assert!(!caps.packetcode.mcp_list);
+        assert!(!caps.packetcode.mcp_defaults);
         assert_eq!(caps.packetcode.permission_modes, modes(&PERMISSION_MODES));
         assert_eq!(caps.packetcode.default_permission_mode, None);
         // Identical to the state used before the handshake completes.

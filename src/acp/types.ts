@@ -131,6 +131,23 @@ export interface SlashCommand {
   argumentHint?: string;
 }
 
+// One MCP server from `_packetcode/mcp/list`. Queried with a session id it
+// describes that session's LIVE fleet (what actually started); without one,
+// the engine's CONFIGURED servers — the `[mcp.<name>]` blocks in the user's
+// config.toml that a session would start if it inherited them. `command` is
+// the disclosure that matters: it names the local subprocess.
+export interface McpServerStatus {
+  name: string;
+  /** "running", "failed", "disabled", or "configured". */
+  status: string;
+  toolCount: number;
+  /** "agent" for the engine's own configuration, "client" for servers an ACP
+   * client supplied. This app never supplies any of its own. */
+  source: string;
+  command: string;
+  error: string;
+}
+
 export interface EngineProbe {
   found: boolean;
   path?: string;
@@ -155,6 +172,15 @@ export interface PacketcodeCapabilities {
   sessionsRename: boolean;
   sessionsUsage: boolean;
   modelsList: boolean;
+  /** Gates the configured-server half of `_packetcode/mcp/list` — the query
+   * with no session id, which is the disclosure surface. */
+  mcpList: boolean;
+  /** A wire-behaviour promise, not a feature toggle: this engine reads an
+   * OMITTED `mcpServers` on session/new as "use your own configured servers".
+   * Unlike every other flag here, false is never "the engine did not say" —
+   * an engine that has not promised this REJECTS the omission, so it must be
+   * read strictly (see canInheritMcp). */
+  mcpDefaults: boolean;
   /** Modes `session/new` accepts, trimmed by the engine to the operator's
    * permission ceiling. Never empty: engines that advertise nothing yield the
    * full five-mode vocabulary, so the picker behaves as it always did. */

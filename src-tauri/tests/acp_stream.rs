@@ -4,9 +4,10 @@
 //! instead of a Tauri AppHandle; no packetcode binary is required.
 
 use packetcode_gui_lib::engine::{
-    cancel_on, capabilities_of, list_commands_on, new_session_on, permission_reply_on,
-    prompt_on, rename_session_on, search_files_on, session_usage_on, start_engine, stop_on,
-    AcpEvents, EngineState, PromptOutcome, SessionUsage, PERMISSION_MODES,
+    cancel_on, capabilities_of, list_commands_on, list_mcp_servers_on, load_session_on,
+    new_session_on, permission_reply_on, prompt_on, rename_session_on, search_files_on,
+    session_usage_on, start_engine, stop_on, AcpEvents, EngineState, McpServerStatus,
+    PromptOutcome, SessionUsage, PERMISSION_MODES,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -187,7 +188,9 @@ fn permission_request_id(payload: &Value) -> Value {
 #[tokio::test]
 async fn happy_path_streams_events_in_order() {
     let (state, mut rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None, None).await.expect("session/new");
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .expect("session/new");
     assert!(session.starts_with("sess-"), "unexpected session id {session}");
 
     let turn = spawn_prompt(&state, &session, "run the demo");
@@ -225,7 +228,9 @@ async fn happy_path_streams_events_in_order() {
 #[tokio::test]
 async fn permission_reject_fails_tool_and_ends_turn() {
     let (state, mut rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
 
     let turn = spawn_prompt(&state, &session, "run the demo");
     expect_streamed_prefix(&mut rx, &session).await;
@@ -256,7 +261,9 @@ async fn permission_reject_fails_tool_and_ends_turn() {
 #[tokio::test]
 async fn cancel_mid_prompt_yields_cancelled_and_rejects_late_permission_reply() {
     let (state, mut rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
 
     let turn = spawn_prompt(&state, &session, "slow demo");
     expect_streamed_prefix(&mut rx, &session).await;
@@ -284,7 +291,9 @@ async fn cancel_mid_prompt_yields_cancelled_and_rejects_late_permission_reply() 
     assert!(err.contains("no pending permission request"), "got: {err}");
 
     // The engine and reader are still healthy: a fresh turn runs to end_turn.
-    let session2 = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session2 = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
     let turn2 = spawn_prompt(&state, &session2, "run the demo");
     expect_streamed_prefix(&mut rx, &session2).await;
     let perm2 = next_permission(&mut rx).await;
@@ -302,7 +311,9 @@ async fn cancel_mid_prompt_yields_cancelled_and_rejects_late_permission_reply() 
 #[tokio::test]
 async fn cancel_during_streaming_chunks_yields_cancelled() {
     let (state, mut rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
 
     let turn = spawn_prompt(&state, &session, "slow demo");
 
@@ -319,7 +330,9 @@ async fn cancel_during_streaming_chunks_yields_cancelled() {
 
     // Anything already in flight when the cancel landed is fine; the session
     // must still accept new turns afterwards.
-    let session2 = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session2 = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
     assert!(session2.starts_with("sess-"));
 
     stop_on(&state).await.unwrap();
@@ -328,7 +341,9 @@ async fn cancel_during_streaming_chunks_yields_cancelled() {
 #[tokio::test]
 async fn malformed_and_interleaved_lines_do_not_wedge_the_reader() {
     let (state, mut rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
 
     // "garbage" makes the mock interleave non-JSON, truncated JSON, a
     // response to an id we never sent, and an unknown notification between
@@ -347,7 +362,9 @@ async fn malformed_and_interleaved_lines_do_not_wedge_the_reader() {
     assert_eq!(outcome.stop_reason, "end_turn");
 
     // Reader is still routing traffic after the garbage.
-    let session2 = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session2 = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
     assert!(session2.starts_with("sess-"));
 
     stop_on(&state).await.unwrap();
@@ -359,7 +376,9 @@ async fn rename_on_engine_without_extension_is_silently_skipped() {
     // same as a real engine that predates the extension. The bridge must treat
     // that as success so auto-titling never surfaces errors on old engines.
     let (state, _rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
     timeout(STEP, rename_session_on(&state, &session, "My first prompt"))
         .await
         .expect("rename timed out")
@@ -370,7 +389,9 @@ async fn rename_on_engine_without_extension_is_silently_skipped() {
 #[tokio::test]
 async fn session_usage_query_returns_engine_values() {
     let (state, _rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
 
     let usage = timeout(STEP, session_usage_on(&state, &session))
         .await
@@ -384,7 +405,9 @@ async fn session_usage_query_returns_engine_values() {
 #[tokio::test]
 async fn session_usage_is_none_on_engines_without_the_extension() {
     let (state, mut rx) = start_mock_with(&["--no-usage"]).await;
-    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
 
     // Method-not-found maps to None (feature absent), not an error.
     let usage = timeout(STEP, session_usage_on(&state, &session))
@@ -457,7 +480,9 @@ async fn restricted_capabilities_are_surfaced_from_the_handshake() {
 
     // The advertised flags agree with what the engine actually serves: usage
     // is on, and rename is one of the methods that still answers -32601.
-    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
     let usage = timeout(STEP, session_usage_on(&state, &session))
         .await
         .expect("usage query timed out")
@@ -477,7 +502,9 @@ async fn restricted_capabilities_reflect_a_disabled_usage_extension() {
     assert!(caps.packetcode.advertised);
     assert!(!caps.packetcode.sessions_usage);
 
-    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
     let usage = timeout(STEP, session_usage_on(&state, &session))
         .await
         .expect("usage query timed out")
@@ -487,10 +514,144 @@ async fn restricted_capabilities_reflect_a_disabled_usage_extension() {
     stop_on(&state).await.unwrap();
 }
 
+/// Names of the servers a session actually runs, for readable assertions.
+fn names(servers: &[McpServerStatus]) -> Vec<&str> {
+    servers.iter().map(|s| s.name.as_str()).collect()
+}
+
+async fn fleet_of(state: &EngineState, session: &str) -> Vec<McpServerStatus> {
+    timeout(STEP, list_mcp_servers_on(state, Some(session)))
+        .await
+        .expect("mcp list timed out")
+        .expect("mcp list failed")
+}
+
+/// The disclosure surface: the configured servers are readable with NO session
+/// id, so the app can show the user what would start — name AND command —
+/// before anything has been spawned. That query is the whole reason consent
+/// can be asked for in advance rather than announced after the fact.
+#[tokio::test]
+async fn configured_mcp_servers_are_readable_before_any_session_exists() {
+    let (state, _rx) = start_mock_with(&["--mcp", "--mcp-defaults"]).await;
+    let caps = capabilities_of(&state).await;
+    assert!(caps.packetcode.mcp_list);
+    assert!(caps.packetcode.mcp_defaults);
+
+    let configured = timeout(STEP, list_mcp_servers_on(&state, None))
+        .await
+        .expect("mcp list timed out")
+        .expect("mcp list failed");
+    assert_eq!(names(&configured), vec!["github", "broken", "muted"]);
+    // The command is the load-bearing disclosure: it is the local subprocess
+    // the user is being asked to authorize.
+    assert_eq!(configured[0].command, "gh-mcp");
+    assert_eq!(configured[2].status, "disabled");
+
+    stop_on(&state).await.unwrap();
+}
+
+/// With consent, session/new and session/load omit mcpServers and the session
+/// runs the engine's own fleet — reported live, with tool counts and the
+/// failure a configuration-only view cannot know about.
+#[tokio::test]
+async fn consented_sessions_inherit_the_engines_mcp_fleet() {
+    let (state, _rx) = start_mock_with(&["--mcp", "--mcp-defaults"]).await;
+    let session = new_session_on(&state, ".", None, None, None, true)
+        .await
+        .unwrap();
+
+    let live = fleet_of(&state, &session).await;
+    assert_eq!(names(&live), vec!["github", "broken", "muted"]);
+    let github = live.iter().find(|s| s.name == "github").unwrap();
+    assert_eq!(github.status, "running");
+    assert_eq!(github.tool_count, 7);
+    assert_eq!(github.source, "agent");
+    let broken = live.iter().find(|s| s.name == "broken").unwrap();
+    assert_eq!(broken.status, "failed");
+    assert_eq!(broken.error, "exec: not found");
+
+    // Resuming must not silently drop the fleet.
+    load_session_on(&state, &session, ".", true).await.unwrap();
+    assert_eq!(names(&fleet_of(&state, &session).await).len(), 3);
+
+    stop_on(&state).await.unwrap();
+}
+
+/// The default, and the state the app stays in until the user says otherwise:
+/// mcpServers travels as an explicit `[]`, so not one configured server is
+/// started. The engine has a fleet on offer and the session still runs none.
+#[tokio::test]
+async fn sessions_without_consent_start_no_mcp_servers() {
+    let (state, _rx) = start_mock_with(&["--mcp", "--mcp-defaults"]).await;
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
+    assert!(fleet_of(&state, &session).await.is_empty());
+
+    load_session_on(&state, &session, ".", false).await.unwrap();
+    assert!(fleet_of(&state, &session).await.is_empty());
+
+    // The engine's configured list is still readable — that is what makes the
+    // choice reversible: the app can show what is on offer while running none.
+    let configured = timeout(STEP, list_mcp_servers_on(&state, None))
+        .await
+        .expect("mcp list timed out")
+        .expect("mcp list failed");
+    assert_eq!(configured.len(), 3);
+
+    stop_on(&state).await.unwrap();
+}
+
+/// Consent alone is not enough. An engine that never advertised `mcpDefaults`
+/// treats a missing mcpServers as invalid-params (the mock answers -32602),
+/// so the bridge must intersect the user's choice with the capability and keep
+/// sending `[]` — an opted-in user on an old engine gets a working session
+/// with no MCP, not a session/new that fails outright.
+#[tokio::test]
+async fn consent_cannot_omit_mcp_servers_on_an_engine_that_never_promised_it() {
+    let (state, _rx) = start_mock_with(&["--mcp"]).await;
+    let caps = capabilities_of(&state).await;
+    assert!(caps.packetcode.mcp_list);
+    assert!(!caps.packetcode.mcp_defaults);
+
+    let session = new_session_on(&state, ".", None, None, None, true)
+        .await
+        .expect("session/new must not fail because the user opted in");
+    assert!(fleet_of(&state, &session).await.is_empty());
+
+    load_session_on(&state, &session, ".", true)
+        .await
+        .expect("session/load must not fail because the user opted in");
+
+    stop_on(&state).await.unwrap();
+}
+
+/// Engines predating `_packetcode/mcp/list` answer method-not-found; that is
+/// "nothing to show", not an error — the chip and the consent prompt simply
+/// never appear.
+#[tokio::test]
+async fn mcp_list_is_empty_on_engines_without_the_extension() {
+    let (state, _rx) = start_mock().await;
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
+
+    assert!(timeout(STEP, list_mcp_servers_on(&state, None))
+        .await
+        .expect("mcp list timed out")
+        .expect("method-not-found must not surface as an error")
+        .is_empty());
+    assert!(fleet_of(&state, &session).await.is_empty());
+
+    stop_on(&state).await.unwrap();
+}
+
 #[tokio::test]
 async fn engine_death_fails_pending_prompt_promptly() {
     let (state, mut rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
 
     let turn = spawn_prompt(&state, &session, "slow demo");
     let u = next_update(&mut rx).await;
@@ -518,8 +679,12 @@ async fn concurrent_sessions_stream_independently_and_cancel_is_scoped() {
     // other — including the other's UNANSWERED permission request, which the
     // user may still be on their way back to answer.
     let (state, mut rx) = start_mock().await;
-    let a = new_session_on(&state, ".", None, None, None).await.unwrap();
-    let b = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let a = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
+    let b = new_session_on(&state, ".", None, None, None, false)
+        .await
+        .unwrap();
     assert_ne!(a, b);
 
     let turn_a = spawn_prompt(&state, &a, "slow demo");

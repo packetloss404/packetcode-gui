@@ -17,6 +17,7 @@
 //     existing timeline, duplicating history.
 
 import type {
+  McpServerStatus,
   ModelOption,
   PermissionMode,
   PermissionRequest,
@@ -81,6 +82,18 @@ export interface SessionEntry {
   /** Latest token/cost usage; null until known (fresh session with no turns
    * yet, or an engine without the usage extension). */
   usage: SessionUsage | null;
+  /** Whether this session was opened asking the engine for its own configured
+   * MCP servers. Fixed at open: flipping the setting later cannot retrofit a
+   * fleet onto a running session, and the chip must not pretend otherwise. */
+  mcpInherited: boolean;
+  /** This session's live MCP fleet from `_packetcode/mcp/list`. Empty for a
+   * session that inherited none, and for engines without the extension.
+   *
+   * Deliberately per-slot rather than a global cache keyed by session id: it
+   * is a property of a live runtime, so it must die with the slot. A session
+   * the engine has evicted has no fleet, and stale entries in a longer-lived
+   * cache would outlive the processes they describe. */
+  mcpServers: McpServerStatus[];
 }
 
 export interface StoreState {
@@ -100,6 +113,8 @@ export type Action =
       key: SessionKey;
       origin: "new" | "load";
       cwd: string;
+      /** Whether this session asked to inherit the engine's MCP servers. */
+      inheritMcp: boolean;
       /** Known up front for a resumed session, null for a fresh one. */
       sessionId: string | null;
     }
@@ -122,6 +137,7 @@ export type Action =
     }
   | { type: "turn_done"; key: SessionKey }
   | { type: "usage"; key: SessionKey; usage: SessionUsage }
+  | { type: "mcp_servers"; key: SessionKey; servers: McpServerStatus[] }
   | { type: "error"; key: SessionKey; message: string };
 
 let nextId = 0;
@@ -215,6 +231,8 @@ export function reduce(state: StoreState, action: Action): StoreState {
         busy: false,
         error: null,
         usage: null,
+        mcpInherited: action.inheritMcp,
+        mcpServers: [],
       };
       return {
         ...state,
@@ -277,6 +295,11 @@ export function reduce(state: StoreState, action: Action): StoreState {
     }
     case "usage":
       return patch(state, action.key, (entry) => ({ ...entry, usage: action.usage }));
+    case "mcp_servers":
+      return patch(state, action.key, (entry) => ({
+        ...entry,
+        mcpServers: action.servers,
+      }));
     case "error":
       return patch(state, action.key, (entry) =>
         settle({ ...entry, busy: false, error: action.message }),

@@ -26,6 +26,7 @@ import {
 } from "react";
 import {
   cancel as acpCancel,
+  listMcpServers,
   loadSession,
   newSession,
   prompt,
@@ -59,8 +60,16 @@ export interface SessionsApi {
     cwd: string,
     model: ModelOption | null,
     permissionMode: PermissionMode | null,
+    /** Whether this session may start the engine's configured MCP servers.
+     * Carries the user's stored consent; false is the safe default and the
+     * only value used until they have answered. */
+    inheritMcp: boolean,
   ) => void;
   send: (key: SessionKey, text: string) => void;
+  /** Re-reads one session's live MCP fleet. Cheap, and the only defence
+   * against a chip that still says "running" for a server that has since
+   * died — see readFleet. */
+  refreshMcp: (key: SessionKey) => void;
   stop: (key: SessionKey) => void;
   answerPermission: (
     key: SessionKey,
@@ -124,6 +133,24 @@ export function SessionsProvider(props: { children: ReactNode }) {
     [],
   );
 
+  /** Reads one session's live MCP fleet into its slot.
+   *
+   * Skipped entirely for a session that did not inherit: it was created with
+   * an explicit `mcpServers: []`, so its fleet is empty by construction and
+   * the query would be a round trip to confirm nothing. Failures are
+   * swallowed and leave the last known fleet in place — including the
+   * "unknown session" a query would hit if the engine has evicted this
+   * session, which is a reason to stop refreshing, not to blank the panel. */
+  const readFleet = useCallback(
+    (key: SessionKey, sessionId: string, inherited: boolean) => {
+      if (!inherited) return;
+      void listMcpServers(sessionId)
+        .then((servers) => dispatch({ type: "mcp_servers", key, servers }))
+        .catch(() => {});
+    },
+    [],
+  );
+
   const open = useCallback(
     (
       key: SessionKey,
@@ -131,6 +158,7 @@ export function SessionsProvider(props: { children: ReactNode }) {
       cwd: string,
       model: ModelOption | null,
       permissionMode: PermissionMode | null,
+      inheritMcp: boolean,
     ) => {
       if (startedRef.current.has(key)) return;
       startedRef.current.add(key);
@@ -139,6 +167,7 @@ export function SessionsProvider(props: { children: ReactNode }) {
         key,
         origin: target.kind,
         cwd,
+        inheritMcp,
         // A resumed session's id is known before session/load returns, and its
         // replay updates arrive while the call is still in flight — the
         // routing index has to carry it from the start.
@@ -150,7 +179,11 @@ export function SessionsProvider(props: { children: ReactNode }) {
           // replays into notifications, and an unlistened notification is lost.
           await routerReady;
           if (target.kind === "load") {
-            await loadSession(target.sessionId, target.workingDir || cwd);
+            await loadSession(
+              target.sessionId,
+              target.workingDir || cwd,
+              inheritMcp,
+            );
             // Resumed sessions keep the provider/model and permission mode they
             // were created with; the pickers' pending choices apply only to
             // fresh sessions.
@@ -161,6 +194,7 @@ export function SessionsProvider(props: { children: ReactNode }) {
               model: null,
               permissionMode: null,
             });
+            readFleet(key, target.sessionId, inheritMcp);
             // Resumed sessions may already have spend; hydrate the statusline.
             // Best-effort: old engines answer null, failures stay quiet.
             void sessionUsage(target.sessionId)
@@ -174,6 +208,7 @@ export function SessionsProvider(props: { children: ReactNode }) {
               model?.provider,
               model?.model,
               permissionMode ?? undefined,
+              inheritMcp,
             );
             dispatch({
               type: "session_ready",
@@ -182,6 +217,7 @@ export function SessionsProvider(props: { children: ReactNode }) {
               model,
               permissionMode,
             });
+            readFleet(key, id, inheritMcp);
           }
         } catch (e) {
           // Reopen the gate so selecting the session again retries; the reducer
@@ -191,7 +227,7 @@ export function SessionsProvider(props: { children: ReactNode }) {
         }
       })();
     },
-    [],
+    [readFleet],
   );
 
   const send = useCallback((key: SessionKey, text: string) => {
@@ -214,6 +250,13 @@ export function SessionsProvider(props: { children: ReactNode }) {
         return;
       }
       dispatch({ type: "turn_done", key });
+      // A fleet is a set of live subprocesses, and one of them can die in the
+      // middle of a session — leaving the chip claiming "running" with the
+      // tool count it had at startup. Turn completion is the refresh point
+      // this app already uses (usage, sidebar), it costs one local IPC, and it
+      // is exactly when the user is about to read the composer again. Between
+      // turns the chip is start-time state, which the panel says outright.
+      readFleet(key, id, entry.mcpInherited);
       // Newer engines attach usage to the prompt result; otherwise (older
       // engine, or a cancelled turn) fall back to an explicit query. Both are
       // best-effort — the statusline just goes stale on failure.
@@ -230,7 +273,16 @@ export function SessionsProvider(props: { children: ReactNode }) {
         // engine predates the extension or the read failed; keep quiet
       }
     })();
-  }, []);
+  }, [readFleet]);
+
+  const refreshMcp = useCallback(
+    (key: SessionKey) => {
+      const entry = getEntry(stateRef.current, key);
+      if (!entry || entry.sessionId === null) return;
+      readFleet(key, entry.sessionId, entry.mcpInherited);
+    },
+    [readFleet],
+  );
 
   const stop = useCallback((key: SessionKey) => {
     const entry = getEntry(stateRef.current, key);
@@ -251,8 +303,8 @@ export function SessionsProvider(props: { children: ReactNode }) {
   );
 
   const api = useMemo<SessionsApi>(
-    () => ({ state, open, send, stop, answerPermission }),
-    [state, open, send, stop, answerPermission],
+    () => ({ state, open, send, stop, answerPermission, refreshMcp }),
+    [state, open, send, stop, answerPermission, refreshMcp],
   );
 
   return (

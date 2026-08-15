@@ -7,6 +7,7 @@ import type {
 } from "../acp/types";
 import { listCommands, searchFiles } from "../acp/client";
 import { projectName } from "../project/projects";
+import { McpChip, type McpPanelProps } from "./McpDisclosure";
 
 const optionKey = (m: ModelOption) => `${m.provider}/${m.model}`;
 
@@ -225,6 +226,8 @@ export function Composer(props: {
   engineDefaultMode: string | null;
   /** Token/cost usage for the ACTIVE session; null hides the statusline. */
   usage: SessionUsage | null;
+  /** MCP disclosure for the ACTIVE session; null hides the chip. */
+  mcp: McpPanelProps | null;
 }) {
   const [text, setText] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -424,6 +427,7 @@ export function Composer(props: {
             <span className="context-chip">no project</span>
           )}
           <span className="context-chip">Local</span>
+          {props.mcp ? <McpChip {...props.mcp} /> : null}
         </div>
         <div className="input-card">
           <div className="ac-anchor">

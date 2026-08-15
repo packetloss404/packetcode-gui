@@ -2,11 +2,13 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   allowedPermissionModes,
+  canInheritMcp,
   engineDefaultPermissionMode,
   supports,
 } from "./acp/capabilities";
 import {
   engineCapabilities,
+  listMcpServers,
   listModels,
   probeEngine,
   startEngine,
@@ -14,15 +16,23 @@ import {
 import type {
   EngineCapabilities,
   EngineProbe,
+  McpServerStatus,
   ModelOption,
   PermissionMode,
   SessionSummary,
 } from "./acp/types";
 import { Gate } from "./components/Gate";
 import { InstallGate } from "./components/InstallGate";
+import { McpConsentDialog } from "./components/McpDisclosure";
 import { ProjectGate } from "./components/ProjectGate";
 import { SessionView } from "./components/SessionView";
 import { Sidebar } from "./components/Sidebar";
+import {
+  loadMcpConsent,
+  needsMcpConsent,
+  saveMcpConsent,
+  type McpConsent,
+} from "./mcp/consent";
 import {
   loadActiveProject,
   loadRecentProjects,
@@ -102,6 +112,25 @@ function Shell() {
   const [models, setModels] = useState<ModelOption[]>([]);
   const [modelChoice, setModelChoice] = useState<ModelOption | null>(null);
   const onModelChoice = useCallback((m: ModelOption) => setModelChoice(m), []);
+  // The engine's configured MCP servers, read once at startup with NO session
+  // id — before anything has been started, which is what lets the app disclose
+  // the commands and ask, rather than announce it after the fact. Empty
+  // whenever the engine cannot serve or honour them, which hides the whole
+  // feature. Not cached across restarts: config.toml is the source of truth
+  // and it can change between launches.
+  const [mcpConfigured, setMcpConfigured] = useState<McpServerStatus[]>([]);
+  // Per-machine consent, remembered in localStorage. Undecided behaves as
+  // "no": no session inherits anything until the user has actually answered.
+  const [mcpConsent, setMcpConsent] = useState<McpConsent>(loadMcpConsent);
+  const onMcpDecide = useCallback((consent: "granted" | "denied") => {
+    saveMcpConsent(consent);
+    setMcpConsent(consent);
+  }, []);
+  const onMcpInherit = useCallback(
+    (on: boolean) => onMcpDecide(on ? "granted" : "denied"),
+    [onMcpDecide],
+  );
+
   // Permission mode for the NEXT session; null = whatever the engine
   // resolves to. Running sessions keep the policy they were created with.
   const [permissionMode, setPermissionMode] = useState<PermissionMode | null>(
@@ -148,6 +177,20 @@ function Shell() {
         }
         setCapabilities(caps);
         setPhase({ name: "ready", probe: result });
+        // Only worth asking when the engine can BOTH list its servers and
+        // honour an omitted mcpServers; otherwise there is no choice to offer
+        // and the chip, the dialog, and the query all stay away.
+        if (canInheritMcp(caps) && supports(caps, "mcpList")) {
+          try {
+            setMcpConfigured(await listMcpServers());
+          } catch {
+            // Best-effort: a failed read just means nothing to disclose, and
+            // sessions keep running with no MCP servers.
+            setMcpConfigured([]);
+          }
+        } else {
+          setMcpConfigured([]);
+        }
         if (!supports(caps, "modelsList")) {
           // Advertised absent: skip the round-trip that would answer -32601.
           setModels([]);
@@ -233,6 +276,9 @@ function Shell() {
 
   return (
     <div className="shell">
+      {needsMcpConsent(mcpConsent, mcpConfigured) ? (
+        <McpConsentDialog configured={mcpConfigured} onDecide={onMcpDecide} />
+      ) : null}
       <Sidebar
         engineVersion={phase.probe.version ?? ""}
         activeSessionId={activeSessionId}
@@ -266,6 +312,9 @@ function Shell() {
           allowedPermissionModes={allowedPermissionModes(capabilities)}
           engineDefaultMode={engineDefaultPermissionMode(capabilities)}
           usageAvailable={supports(capabilities, "sessionsUsage")}
+          mcpConfigured={mcpConfigured}
+          mcpInherit={mcpConsent === "granted"}
+          onMcpInherit={onMcpInherit}
         />
       )}
     </div>

@@ -60,6 +60,7 @@ export function ProjectGate(props: {
         allowedPermissionModes={null}
         engineDefaultMode={null}
         usage={null}
+        mcp={null}
       />
     </section>
   );

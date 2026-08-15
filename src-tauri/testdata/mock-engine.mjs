@@ -30,7 +30,8 @@ if (args[0] === "doctor") {
 
 if (args[0] !== "acp") {
   process.stderr.write(
-    "usage: mock-engine.mjs <doctor --json | acp> [--no-usage] [--no-affordances] [--restricted-caps]\n"
+    "usage: mock-engine.mjs <doctor --json | acp> [--no-usage] [--no-affordances] " +
+      "[--restricted-caps] [--mcp] [--mcp-defaults]\n"
   );
   process.exit(2);
 }
@@ -61,6 +62,66 @@ const projectFiles = ["src/App.tsx", "src/components/Composer.tsx"];
 // mix of extension flags. Without the flag the mock advertises no vendor
 // block at all, exactly like an engine predating capability negotiation.
 const restrictedCaps = args.includes("--restricted-caps");
+// --mcp serves the _packetcode/mcp/list extension (and advertises mcpList);
+// without it the method answers -32601 like an engine predating it.
+const withMCP = args.includes("--mcp");
+// --mcp-defaults advertises mcpDefaults: the promise that an OMITTED
+// mcpServers on session/new and session/load means "use the agent's own
+// configured servers". Kept separate from --mcp so a test can drive an engine
+// that exposes the list but still REQUIRES the field — where a client that
+// omitted it would break every session, which is why the omission is refused
+// with -32602 below unless this flag is on.
+const withMCPDefaults = args.includes("--mcp-defaults");
+// The agent's configured [mcp.<name>] blocks, as the sessionId-less query
+// reports them: this is the disclosure surface, readable before any session
+// exists. "muted" stands for a server the operator deliberately switched off.
+const configuredMCP = [
+  { name: "github", status: "configured", toolCount: 0, source: "agent", command: "gh-mcp", error: "" },
+  { name: "broken", status: "configured", toolCount: 0, source: "agent", command: "nope", error: "" },
+  { name: "muted", status: "disabled", toolCount: 0, source: "agent", command: "muted-mcp", error: "" },
+];
+// What those servers look like once a session has actually started them: one
+// running with tools, one that failed, one still deliberately disabled.
+const inheritedMCP = [
+  { name: "github", status: "running", toolCount: 7, source: "agent", command: "gh-mcp", error: "" },
+  { name: "broken", status: "failed", toolCount: 0, source: "agent", command: "nope", error: "exec: not found" },
+  { name: "muted", status: "disabled", toolCount: 0, source: "agent", command: "muted-mcp", error: "" },
+];
+// sessionId -> that session's live fleet. Populated from what session/new and
+// session/load actually carried, so a test reads the consequence of the wire
+// shape (which servers run) instead of the frame itself.
+const sessionFleets = new Map();
+
+// Applies the three-way mcpServers contract to one session request. Returns
+// an error object to reply with, or null once the session's fleet is recorded.
+function recordFleet(sessionId, params) {
+  const supplied = params?.mcpServers;
+  if (supplied === undefined) {
+    if (!withMCPDefaults) {
+      // Exactly what an engine predating the contract does: the field is
+      // mandatory, so a client that omits it breaks the whole session.
+      return { code: -32602, message: "mcpServers is required" };
+    }
+    sessionFleets.set(sessionId, inheritedMCP);
+    return null;
+  }
+  if (!Array.isArray(supplied)) {
+    return { code: -32602, message: "mcpServers must be an array" };
+  }
+  // An explicit list is the client's own fleet; [] means "no MCP servers".
+  sessionFleets.set(
+    sessionId,
+    supplied.map((server) => ({
+      name: String(server?.name ?? ""),
+      status: "running",
+      toolCount: 1,
+      source: "client",
+      command: String(server?.command ?? ""),
+      error: "",
+    }))
+  );
+  return null;
+}
 // Static usage served by the extension and attached to end_turn prompt
 // results, mirroring the real engine's enrichment.
 const sessionUsage = {
@@ -273,13 +334,8 @@ function handleLine(line) {
   }
 
   switch (method) {
-    case "initialize":
-      send({
-        jsonrpc: "2.0",
-        id,
-        result: {
-          protocolVersion: 1,
-          agentCapabilities: restrictedCaps
+    case "initialize": {
+      const agentCapabilities = restrictedCaps
             ? {
                 loadSession: true,
                 promptCapabilities: { image: false, audio: false },
@@ -296,15 +352,72 @@ function handleLine(line) {
                   futureExtension: { enabled: true },
                 },
               }
-            : { loadSession: false },
+            : { loadSession: false };
+      if (withMCP || withMCPDefaults) {
+        agentCapabilities._packetcode = {
+          ...(agentCapabilities._packetcode ?? {}),
+          mcpList: withMCP,
+          mcpDefaults: withMCPDefaults,
+        };
+      }
+      send({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: 1,
+          agentCapabilities,
           agentInfo: { name: "mock", version: "0.1.0" },
         },
       });
       break;
-    case "session/new":
+    }
+    case "session/new": {
       sessionCounter += 1;
-      send({ jsonrpc: "2.0", id, result: { sessionId: `sess-${sessionCounter}` } });
+      const sessionId = `sess-${sessionCounter}`;
+      const error = recordFleet(sessionId, params);
+      if (error) {
+        send({ jsonrpc: "2.0", id, error });
+        break;
+      }
+      send({ jsonrpc: "2.0", id, result: { sessionId } });
       break;
+    }
+    case "session/load": {
+      const sessionId = String(params?.sessionId ?? "");
+      const error = recordFleet(sessionId, params);
+      if (error) {
+        send({ jsonrpc: "2.0", id, error });
+        break;
+      }
+      send({ jsonrpc: "2.0", id, result: {} });
+      break;
+    }
+    case "_packetcode/mcp/list": {
+      if (!withMCP) {
+        send({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32601, message: `Method not found: ${method}` },
+        });
+        break;
+      }
+      const sessionId = params?.sessionId;
+      if (typeof sessionId === "string" && sessionId.trim()) {
+        const fleet = sessionFleets.get(sessionId.trim());
+        if (fleet === undefined) {
+          send({
+            jsonrpc: "2.0",
+            id,
+            error: { code: -32602, message: `unknown session ${sessionId}` },
+          });
+          break;
+        }
+        send({ jsonrpc: "2.0", id, result: { servers: fleet } });
+        break;
+      }
+      send({ jsonrpc: "2.0", id, result: { servers: configuredMCP } });
+      break;
+    }
     case "session/prompt":
       handlePrompt(id, params);
       break;
