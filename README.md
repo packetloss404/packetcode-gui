@@ -10,7 +10,9 @@ Packetcode Desktop does **not** bundle or reimplement the agent. It drives the s
 - **Projects** — open any directory as a project; recent projects and their sessions live in the sidebar
 - **Interactive approvals** — packetcode's permission requests surface as inline cards; allow or reject without leaving the flow
 - **Per-session permission modes** — read-only through bypass, chosen in the composer, enforced (and capped) by the engine
+- **Concurrent sessions** — start a turn, switch away, come back to it finished; sidebar dots show running (blue) and needs-approval (amber) per session
 - **Session history & resume** — sessions grouped by project, resumed over ACP `session/load` with full transcript replay, live titles, inline rename
+- **Slash commands and @ mentions** — the composer's `/` menu lists your markdown commands (the engine expands them server-side) and `@` searches project files
 - **Model picker** — per-session provider/model choice served by the engine's model catalog
 - **Usage statusline** — context occupancy, cumulative tokens, and cost under the composer after every turn
 - **Guided install** — if no engine is found (or it's too old), the app offers packetcode's official install script with live output, then verifies the result
@@ -56,7 +58,7 @@ React 19 UI  ──invoke/events──  Tauri (Rust)  ──ACP over stdio──
 
 - `src-tauri/src/engine.rs` — engine bridge: binary resolution, `doctor --json` probe + minimum-version gate, `AcpBridge` (JSON-RPC client with an event-sink trait), installer command
 - `src/acp/` — protocol types and the typed frontend bridge
-- `src/session/useSession.ts` — reduces ACP `session/update` streams into the renderable timeline
+- `src/session/store.ts` / `router.ts` / `SessionsProvider.tsx` — sessionId-keyed store, one global ACP listener pair, and the provider that owns both; sessions keep streaming while their view is unmounted
 - `src/styles/tokens.css` — Graphite design tokens, mirrored from PacketADE
 
 ### Engine contract
@@ -74,6 +76,7 @@ Vendor extensions (feature-detected via `agentCapabilities._packetcode` in the `
 | `_packetcode/commands/list` | Slash commands for the composer's `/` menu. The engine reports only markdown commands from `~/.packetcode/commands` and `<cwd>/.packetcode/commands`; its built-in slash commands are TUI affordances with no ACP equivalent. It expands a leading `/name` in `session/prompt` into the command's prompt |
 | `_packetcode/project/files` | Project file search for the composer's `@` menu, using the engine's own ignore rules |
 | `session/new` `_packetcode: {provider, model, permissionMode}` | Per-session model and permission-mode overrides (the engine caps requested modes at its configured profile) |
+| `initialize` `agentCapabilities._packetcode` | Advertised extension flags, allowed `permissionModes`, and `defaultPermissionMode` — the app offers only what the engine will accept |
 
 Both composer affordances degrade to an empty list on engines without them, and the composer's placeholder drops the promises it cannot keep — down to a bare "Do anything" when neither is served.
 
