@@ -6,7 +6,7 @@ import { useCallback, useEffect, useRef } from "react";
 import type { ModelOption, PermissionMode } from "../acp/types";
 import { projectName } from "../project/projects";
 import { useSessions } from "../session/SessionsProvider";
-import { getEntry, resolveKey, type SessionTarget } from "../session/store";
+import { getEntry, isEngaged, resolveKey, type SessionTarget } from "../session/store";
 import { Composer } from "./Composer";
 import { TimelineItemView } from "./TimelineItemView";
 
@@ -52,6 +52,13 @@ export function SessionView(props: {
     [answerPermission, key],
   );
 
+  // "Busy" for the composer means "this session owes the engine something":
+  // a turn in flight, OR an approval card the engine is blocked on. Driving it
+  // from the same derived rule as the sidebar dot is what keeps Stop on screen
+  // after a failed prompt — busy alone goes false there, and Stop is the only
+  // affordance that unblocks the engine's callClient, which has no timeout.
+  const engaged = entry !== null && isEngaged(entry);
+
   const shownCwd =
     props.target.kind === "load" && props.target.workingDir
       ? props.target.workingDir
@@ -95,7 +102,7 @@ export function SessionView(props: {
         </div>
       </div>
       <Composer
-        busy={entry?.busy ?? false}
+        busy={engaged}
         onSend={onSend}
         onStop={onStop}
         models={props.models}

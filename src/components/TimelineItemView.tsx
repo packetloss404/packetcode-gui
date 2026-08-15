@@ -31,10 +31,21 @@ export function TimelineItemView(props: {
       );
     case "permission":
       return (
-        <div className="approval">
-          <div className="approval-label">Permission required</div>
+        <div className={item.auto ? "approval auto" : "approval"}>
+          <div className="approval-label">
+            {item.auto ? "Permission declined for you" : "Permission required"}
+          </div>
           <div className="approval-target">{item.request.toolCall.title}</div>
-          {item.resolved ? (
+          {item.resolved && item.auto ? (
+            // A refusal the user never made. Say so in those words: "answered"
+            // would read as though they had clicked something.
+            <div className="approval-auto">
+              declined automatically — this window had no session to show it in
+              {item.resolved === "unanswered"
+                ? ", and no reply could be sent"
+                : null}
+            </div>
+          ) : item.resolved ? (
             <div className="thought">answered: {item.resolved}</div>
           ) : (
             <div className="approval-actions">

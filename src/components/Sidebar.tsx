@@ -15,6 +15,34 @@ function relativeTime(iso: string): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
+/** Rows to show for one project: every LIVE session first, then the most
+ * recent `limit` of the rest.
+ *
+ * The cap exists so a long history does not bury the projects below it, but a
+ * session that is running — or, worse, waiting on a permission answer — stops
+ * being touched on disk and slides down the list as other sessions finish.
+ * Dropping it off the end hides an amber dot behind a scroll the user has no
+ * reason to perform, and its engine turn stays blocked until they find it. So
+ * live sessions are exempt from the cap and pinned to the top of their group:
+ * the one row that needs the user is the one row they cannot miss. */
+export function visibleSessions(
+  sessions: SessionSummary[],
+  status: Record<string, SessionStatus | undefined>,
+  limit: number,
+): SessionSummary[] {
+  const live: SessionSummary[] = [];
+  const rest: SessionSummary[] = [];
+  for (const s of sessions) {
+    const st = status[s.sessionId];
+    if (st === "running" || st === "attention") live.push(s);
+    else rest.push(s);
+  }
+  return [...live, ...rest.slice(0, limit)];
+}
+
+/** History rows per project before live sessions are added back on top. */
+const SESSION_LIMIT = 8;
+
 interface ProjectGroup {
   /** Absolute directory, or "" for sessions with no recorded workingDir. */
   dir: string;
@@ -41,6 +69,11 @@ export function Sidebar(props: {
   /** False when the engine advertised no `_packetcode/sessions/rename`: the
    * rename affordance is hidden rather than silently doing nothing. */
   canRenameSessions: boolean;
+  /** False when the engine advertised no `_packetcode/sessions/list`. The
+   * bridge then reads `~/.packetcode/sessions` itself, so rows still appear —
+   * but they are a disk read of the engine's files rather than the engine's
+   * own answer, and the sidebar says so instead of pretending otherwise. */
+  canListSessions: boolean;
 }) {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -120,6 +153,9 @@ export function Sidebar(props: {
         <div className="session-row">no projects yet</div>
       ) : null}
       {error ? <div className="session-row">history unavailable</div> : null}
+      {!props.canListSessions && !error ? (
+        <div className="session-row muted-row">history read from disk</div>
+      ) : null}
       {projects.map((group) => {
         const key = group.dir === "" ? "(none)" : pathKey(group.dir);
         const activeProject =
@@ -146,7 +182,11 @@ export function Sidebar(props: {
                 {activeProject ? <span className="project-mark">●</span> : null}
               </button>
             )}
-            {group.sessions.slice(0, 8).map((s) => {
+            {visibleSessions(
+              group.sessions,
+              props.sessionStatus,
+              SESSION_LIMIT,
+            ).map((s) => {
               const active = s.sessionId === props.activeSessionId;
               // The dot reports the SESSION, not the selection: blue while its
               // turn runs, amber while it waits on a permission answer the
@@ -177,8 +217,6 @@ export function Sidebar(props: {
                   </div>
                 );
               }
-              // Renaming a RESIDENT session is disabled: its live runtime
-              // rewrites the whole session file on the next save, which can
               // Renaming a session with a LIVE TURN is disabled: its runtime
               // rewrites the whole session file on the next save, which can
               // both revert the name and clobber concurrent writes. Merely

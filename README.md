@@ -8,9 +8,9 @@ Packetcode Desktop does **not** bundle or reimplement the agent. It drives the s
 
 - **Chat with the real engine** — streaming responses, agent thoughts, markdown rendering, tool-call cards with live output
 - **Projects** — open any directory as a project; recent projects and their sessions live in the sidebar
-- **Interactive approvals** — packetcode's permission requests surface as inline cards; allow or reject without leaving the flow
+- **Interactive approvals** — packetcode's permission requests surface as inline cards; allow or reject without leaving the flow. Nothing is decided for you in silence: the one request the app cannot route (no open session owns it) is declined and reported as a dismissible notice, naming the tool call it refused
 - **Per-session permission modes** — read-only through bypass, chosen in the composer, enforced (and capped) by the engine
-- **Concurrent sessions** — start a turn, switch away, come back to it finished; sidebar dots show running (blue) and needs-approval (amber) per session
+- **Concurrent sessions** — start a turn, switch away, come back to it finished; sidebar dots show running (blue) and needs-approval (amber) per session, and a live session is pinned above its project's history so it can never scroll out of reach
 - **Session history & resume** — sessions grouped by project, resumed over ACP `session/load` with full transcript replay, live titles, inline rename
 - **Slash commands and @ mentions** — the composer's `/` menu lists your markdown commands (the engine expands them server-side) and `@` searches project files
 - **Model picker** — per-session provider/model choice served by the engine's model catalog
@@ -69,7 +69,7 @@ Vendor extensions (feature-detected via `agentCapabilities._packetcode` in the `
 
 | Method | Purpose |
 |---|---|
-| `_packetcode/sessions/list` | Session history for the sidebar (disk fallback exists) |
+| `_packetcode/sessions/list` | Session history for the sidebar; an engine that advertises it as absent is never asked, and the sidebar reads `~/.packetcode/sessions` instead (and says so) |
 | `_packetcode/sessions/rename` | Inline session rename from the sidebar |
 | `_packetcode/sessions/usage` | Token/cost usage for the statusline (newer engines also attach usage to prompt results) |
 | `_packetcode/models/list` | Provider/model catalog for the picker |

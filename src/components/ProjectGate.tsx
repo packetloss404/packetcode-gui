@@ -1,7 +1,16 @@
 // First-run / no-project state: shown in place of the session view until a
 // project directory is chosen. Creating a session without a meaningful cwd
 // is a footgun, so the composer renders disabled underneath the prompt.
+//
+// The permission-mode picker is live here even though the prompt is not, and
+// the engine's real ceiling is threaded in rather than stubbed. Both halves
+// matter: picking a project creates its first session immediately, so this is
+// the ONLY screen on which that session's mode can still be chosen — and a
+// picker that offered all five modes (bypass included) under an operator
+// ceiling would be the one place in the app that advertises a mode session/new
+// would reject with -32602.
 
+import type { PermissionMode } from "../acp/types";
 import { projectName } from "../project/projects";
 import { Composer } from "./Composer";
 
@@ -9,6 +18,13 @@ export function ProjectGate(props: {
   recentProjects: string[];
   onOpenProject: () => void;
   onSelectProject: (dir: string) => void;
+  /** Mode the next session will be created with; null = engine default. */
+  permissionMode: PermissionMode | null;
+  onPermissionMode: (m: PermissionMode) => void;
+  /** Modes the engine will accept; null = it did not say, so offer all. */
+  allowedPermissionModes: string[] | null;
+  /** Mode a session with no override runs under; null = not advertised. */
+  engineDefaultMode: string | null;
 }) {
   return (
     <section className="content">
@@ -55,10 +71,10 @@ export function ProjectGate(props: {
         onModelChoice={() => undefined}
         projectDir={null}
         sessionPermissionMode={null}
-        permissionMode={null}
-        onPermissionMode={() => undefined}
-        allowedPermissionModes={null}
-        engineDefaultMode={null}
+        permissionMode={props.permissionMode}
+        onPermissionMode={props.onPermissionMode}
+        allowedPermissionModes={props.allowedPermissionModes}
+        engineDefaultMode={props.engineDefaultMode}
         usage={null}
       />
     </section>
