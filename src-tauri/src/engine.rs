@@ -594,11 +594,39 @@ pub async fn engine_new_session(
     new_session_on(&state, &cwd, provider, model).await
 }
 
+/// Per-session token/cost usage, as served by the engine's
+/// `_packetcode/sessions/usage` extension and attached to successful
+/// `session/prompt` results under `_packetcode.usage`. Parsed defensively:
+/// the engine may be newer and grow fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionUsage {
+    #[serde(default)]
+    pub context_tokens: u64,
+    #[serde(default)]
+    pub total_input: u64,
+    #[serde(default)]
+    pub total_output: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+/// Outcome of one prompt turn. `usage` is present only when the engine
+/// enriched the result (`_packetcode.usage`); older engines yield `None` and
+/// the frontend falls back to an explicit usage query.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptOutcome {
+    pub stop_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<SessionUsage>,
+}
+
 pub async fn prompt_on(
     state: &EngineState,
     session_id: &str,
     text: &str,
-) -> Result<String, String> {
+) -> Result<PromptOutcome, String> {
     let result = bridge_of(state)
         .await?
         .request(
@@ -610,11 +638,17 @@ pub async fn prompt_on(
             PROMPT_TIMEOUT,
         )
         .await?;
-    Ok(result
+    let stop_reason = result
         .get("stopReason")
         .and_then(Value::as_str)
         .unwrap_or("end_turn")
-        .to_string())
+        .to_string();
+    // Vendor enrichment is best-effort: a malformed usage object degrades to
+    // None rather than failing a turn that already completed.
+    let usage = result
+        .pointer("/_packetcode/usage")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    Ok(PromptOutcome { stop_reason, usage })
 }
 
 #[tauri::command]
@@ -622,8 +656,40 @@ pub async fn engine_prompt(
     session_id: String,
     text: String,
     state: State<'_, EngineState>,
-) -> Result<String, String> {
+) -> Result<PromptOutcome, String> {
     prompt_on(&state, &session_id, &text).await
+}
+
+/// Usage for one session via the engine's `_packetcode/sessions/usage` ACP
+/// extension. Engines that predate the extension answer method-not-found;
+/// that is not an error — the statusline simply has nothing to show.
+pub async fn session_usage_on(
+    state: &EngineState,
+    session_id: &str,
+) -> Result<Option<SessionUsage>, String> {
+    let response = bridge_of(state)
+        .await?
+        .request(
+            "_packetcode/sessions/usage",
+            json!({ "sessionId": session_id }),
+            REQUEST_TIMEOUT,
+        )
+        .await;
+    match response {
+        Ok(result) => serde_json::from_value(result)
+            .map(Some)
+            .map_err(|e| format!("bad usage payload: {e}")),
+        Err(err) if err.contains("-32601") || err.contains("Method not found") => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+#[tauri::command]
+pub async fn engine_session_usage(
+    session_id: String,
+    state: State<'_, EngineState>,
+) -> Result<Option<SessionUsage>, String> {
+    session_usage_on(&state, &session_id).await
 }
 
 pub async fn cancel_on(state: &EngineState, session_id: &str) -> Result<(), String> {

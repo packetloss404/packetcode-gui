@@ -1,7 +1,38 @@
 import { useEffect, useState } from "react";
-import type { ModelOption } from "../acp/types";
+import type { ModelOption, SessionUsage } from "../acp/types";
 
 const optionKey = (m: ModelOption) => `${m.provider}/${m.model}`;
+
+/** Compact token count: 820 -> "820", 41234 -> "41.2k", 1200000 -> "1.2M". */
+function fmtTokens(n: number): string {
+  const scaled = (value: number, suffix: string) => {
+    const rounded = Math.round(value * 10) / 10;
+    const text = Number.isInteger(rounded)
+      ? String(rounded)
+      : rounded.toFixed(1);
+    return text + suffix;
+  };
+  if (n >= 1_000_000) return scaled(n / 1_000_000, "M");
+  if (n >= 1000) return scaled(n / 1000, "k");
+  return String(n);
+}
+
+/** "$1.84"; sub-cent spend keeps a third digit instead of showing $0.00. */
+function fmtCost(usd: number): string {
+  return usd >= 0.01 || usd === 0 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(3)}`;
+}
+
+/** `ctx 41.2k tok · in 82k · out 12k · $1.84`, omitting unknown/zero
+ * segments; null when there is nothing to show. */
+export function usageStatusline(usage: SessionUsage | null): string | null {
+  if (!usage) return null;
+  const segments: string[] = [];
+  if (usage.contextTokens > 0) segments.push(`ctx ${fmtTokens(usage.contextTokens)} tok`);
+  if (usage.totalInput > 0) segments.push(`in ${fmtTokens(usage.totalInput)}`);
+  if (usage.totalOutput > 0) segments.push(`out ${fmtTokens(usage.totalOutput)}`);
+  if (usage.costUsd > 0) segments.push(fmtCost(usage.costUsd));
+  return segments.length > 0 ? segments.join(" · ") : null;
+}
 
 export function Composer(props: {
   busy: boolean;
@@ -14,6 +45,8 @@ export function Composer(props: {
   /** Pending choice for the NEXT session; null = engine default. */
   modelChoice: ModelOption | null;
   onModelChoice: (m: ModelOption) => void;
+  /** Token/cost usage for the ACTIVE session; null hides the statusline. */
+  usage: SessionUsage | null;
 }) {
   const [text, setText] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -46,6 +79,8 @@ export function Composer(props: {
     props.onModelChoice(m);
     setPickerOpen(false);
   };
+
+  const statusline = usageStatusline(props.usage);
 
   return (
     <div className="composer-zone">
@@ -144,6 +179,11 @@ export function Composer(props: {
           </div>
         </div>
       </div>
+      {statusline ? (
+        <div className="statusline">
+          <span>{statusline}</span>
+        </div>
+      ) : null}
     </div>
   );
 }

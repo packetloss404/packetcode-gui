@@ -10,12 +10,14 @@ import {
   onSessionUpdate,
   prompt,
   replyPermission,
+  sessionUsage,
 } from "../acp/client";
 import type {
   ModelOption,
   PermissionRequest,
   PlanEntry,
   SessionUpdate,
+  SessionUsage,
   ToolCallStatus,
   ToolKind,
 } from "../acp/types";
@@ -51,6 +53,9 @@ export interface SessionState {
   plan: PlanEntry[];
   busy: boolean;
   error: string | null;
+  /** Latest token/cost usage for this session; null until known (fresh
+   * session with no turns yet, or an engine without the usage extension). */
+  usage: SessionUsage | null;
 }
 
 type Action =
@@ -60,6 +65,7 @@ type Action =
   | { type: "permission_request"; request: PermissionRequest }
   | { type: "permission_resolved"; requestId: string | number; optionId: string }
   | { type: "turn_done" }
+  | { type: "usage"; usage: SessionUsage }
   | { type: "error"; message: string };
 
 let nextId = 0;
@@ -72,6 +78,7 @@ const initial: SessionState = {
   plan: [],
   busy: false,
   error: null,
+  usage: null,
 };
 
 function reduce(state: SessionState, action: Action): SessionState {
@@ -86,6 +93,8 @@ function reduce(state: SessionState, action: Action): SessionState {
       };
     case "turn_done":
       return { ...state, busy: false };
+    case "usage":
+      return { ...state, usage: action.usage };
     case "error":
       return { ...state, busy: false, error: action.message };
     case "permission_request":
@@ -233,6 +242,13 @@ export function useSession(
           await loadSession(target.sessionId, target.workingDir || cwd);
           if (disposed) return;
           dispatch({ type: "session_ready", sessionId: target.sessionId, model: null });
+          // Resumed sessions may already have spend; hydrate the statusline.
+          // Best-effort: old engines answer null, failures stay quiet.
+          void sessionUsage(target.sessionId)
+            .then((usage) => {
+              if (!disposed && usage) dispatch({ type: "usage", usage });
+            })
+            .catch(() => {});
         } else {
           const choice = getModelChoice?.() ?? null;
           const id = await newSession(cwd, choice?.provider, choice?.model);
@@ -261,13 +277,27 @@ export function useSession(
     const id = sessionRef.current;
     if (!id) return;
     dispatch({ type: "user_prompt", text });
+    let outcome;
     try {
-      await prompt(id, text);
+      outcome = await prompt(id, text);
     } catch (e) {
       dispatch({ type: "error", message: String(e) });
       return;
     }
     dispatch({ type: "turn_done" });
+    // Newer engines attach usage to the prompt result; otherwise (older
+    // engine, or a cancelled turn) fall back to an explicit query. Both are
+    // best-effort — the statusline just goes stale on failure.
+    if (outcome?.usage) {
+      dispatch({ type: "usage", usage: outcome.usage });
+    } else {
+      try {
+        const usage = await sessionUsage(id);
+        if (usage) dispatch({ type: "usage", usage });
+      } catch {
+        // engine predates the extension or the read failed; keep quiet
+      }
+    }
   }, []);
 
   const stop = useCallback(() => {

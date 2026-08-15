@@ -61,6 +61,7 @@ export function SessionView(props: {
         sessionModel={state.model}
         modelChoice={props.modelChoice}
         onModelChoice={props.onModelChoice}
+        usage={state.usage}
       />
     </section>
   );

@@ -82,6 +82,23 @@ export interface SessionSummary {
   costUsd: number;
 }
 
+// Per-session token/cost usage from `_packetcode/sessions/usage`, also
+// attached to successful prompt outcomes by newer engines. contextTokens is
+// the live context-window occupancy; totalInput/totalOutput are cumulative.
+export interface SessionUsage {
+  contextTokens: number;
+  totalInput: number;
+  totalOutput: number;
+  costUsd: number;
+}
+
+// Outcome of one prompt turn from the Rust bridge. `usage` is present only
+// when the engine enriched the result; older engines omit it.
+export interface PromptOutcome {
+  stopReason: StopReason;
+  usage?: SessionUsage | null;
+}
+
 // One selectable provider/model pair from `_packetcode/models/list`.
 // `default` marks the pair the engine uses when session/new carries no
 // override.

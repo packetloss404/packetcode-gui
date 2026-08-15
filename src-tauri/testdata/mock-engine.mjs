@@ -29,9 +29,21 @@ if (args[0] === "doctor") {
 }
 
 if (args[0] !== "acp") {
-  process.stderr.write("usage: mock-engine.mjs <doctor --json | acp>\n");
+  process.stderr.write("usage: mock-engine.mjs <doctor --json | acp> [--no-usage]\n");
   process.exit(2);
 }
+
+// --no-usage simulates an engine predating the _packetcode/sessions/usage
+// extension: the method answers -32601 and prompt results stay bare.
+const noUsage = args.includes("--no-usage");
+// Static usage served by the extension and attached to end_turn prompt
+// results, mirroring the real engine's enrichment.
+const sessionUsage = {
+  contextTokens: 41234,
+  totalInput: 82000,
+  totalOutput: 12000,
+  costUsd: 1.84,
+};
 
 const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
 const sendRaw = (line) => process.stdout.write(line + "\n");
@@ -91,7 +103,12 @@ async function handlePrompt(id, params) {
 
   const finish = (stopReason) => {
     inflight = null;
-    send({ jsonrpc: "2.0", id, result: { stopReason } });
+    const result = { stopReason };
+    // Match the real engine: only successful turns carry usage enrichment.
+    if (!noUsage && stopReason === "end_turn") {
+      result._packetcode = { usage: sessionUsage };
+    }
+    send({ jsonrpc: "2.0", id, result });
   };
 
   const D = text.includes("slow") ? 40 : 10;
@@ -246,6 +263,25 @@ function handleLine(line) {
       break;
     case "session/prompt":
       handlePrompt(id, params);
+      break;
+    case "_packetcode/sessions/usage":
+      if (noUsage) {
+        send({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32601, message: `Method not found: ${method}` },
+        });
+        break;
+      }
+      if (typeof params?.sessionId !== "string" || !params.sessionId.trim()) {
+        send({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32602, message: "sessionId is required" },
+        });
+        break;
+      }
+      send({ jsonrpc: "2.0", id, result: sessionUsage });
       break;
     case "session/cancel":
       // Notification: cancel the in-flight prompt, if any.
