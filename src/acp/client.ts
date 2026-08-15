@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   EngineProbe,
+  ModelOption,
   PermissionRequest,
   SessionNotification,
   SessionSummary,
@@ -19,8 +20,16 @@ export function startEngine(): Promise<void> {
   return invoke("engine_start");
 }
 
-export function newSession(cwd: string): Promise<string> {
-  return invoke<string>("engine_new_session", { cwd });
+export function newSession(
+  cwd: string,
+  provider?: string,
+  model?: string,
+): Promise<string> {
+  return invoke<string>("engine_new_session", {
+    cwd,
+    provider: provider ?? null,
+    model: model ?? null,
+  });
 }
 
 export function prompt(sessionId: string, text: string): Promise<StopReason> {
@@ -33,6 +42,10 @@ export function cancel(sessionId: string): Promise<void> {
 
 export function listSessions(): Promise<SessionSummary[]> {
   return invoke<SessionSummary[]>("engine_list_sessions");
+}
+
+export function listModels(): Promise<ModelOption[]> {
+  return invoke<ModelOption[]>("engine_list_models");
 }
 
 export function installEngine(): Promise<void> {

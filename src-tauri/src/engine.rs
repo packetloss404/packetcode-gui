@@ -384,6 +384,8 @@ async fn request(
 #[tauri::command]
 pub async fn engine_new_session(
     cwd: String,
+    provider: Option<String>,
+    model: Option<String>,
     state: State<'_, EngineState>,
 ) -> Result<String, String> {
     let abs = std::fs::canonicalize(&cwd)
@@ -392,13 +394,28 @@ pub async fn engine_new_session(
         .to_string();
     // Windows canonicalize yields \\?\ paths; the engine wants plain absolutes.
     let abs = abs.trim_start_matches(r"\\?\").to_string();
-    let result = request(
-        &state,
-        "session/new",
-        json!({ "cwd": abs, "mcpServers": [] }),
-        REQUEST_TIMEOUT,
-    )
-    .await?;
+    let mut params = json!({ "cwd": abs, "mcpServers": [] });
+    // Optional per-session provider/model override, carried in the engine's
+    // "_packetcode" vendor-extension params object. Omitted entirely when the
+    // caller wants the engine defaults, so older engines see a spec-only call.
+    let provider = provider
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    let model = model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+    if provider.is_some() || model.is_some() {
+        let mut ext = serde_json::Map::new();
+        if let Some(p) = provider {
+            ext.insert("provider".into(), json!(p));
+        }
+        if let Some(m) = model {
+            ext.insert("model".into(), json!(m));
+        }
+        params
+            .as_object_mut()
+            .expect("session/new params are an object")
+            .insert("_packetcode".into(), Value::Object(ext));
+    }
+    let result = request(&state, "session/new", params, REQUEST_TIMEOUT).await?;
     result
         .get("sessionId")
         .and_then(Value::as_str)
@@ -509,6 +526,32 @@ pub async fn engine_list_sessions(
         Err(err) if err.contains("-32601") || err.contains("Method not found") => {
             list_sessions_from_disk()
         }
+        Err(err) => Err(err),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOption {
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub default: bool,
+}
+
+/// Provider/model choices via the engine's `_packetcode/models/list` ACP
+/// extension. Engines that predate the extension answer method-not-found;
+/// that is not an error — the picker simply has nothing to offer.
+#[tauri::command]
+pub async fn engine_list_models(
+    state: State<'_, EngineState>,
+) -> Result<Vec<ModelOption>, String> {
+    match request(&state, "_packetcode/models/list", json!({}), REQUEST_TIMEOUT).await {
+        Ok(result) => {
+            let models = result.get("models").cloned().unwrap_or(json!([]));
+            serde_json::from_value(models).map_err(|e| format!("bad models payload: {e}"))
+        }
+        Err(err) if err.contains("-32601") || err.contains("Method not found") => Ok(Vec::new()),
         Err(err) => Err(err),
     }
 }

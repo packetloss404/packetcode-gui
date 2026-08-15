@@ -11,6 +11,7 @@ import {
   replyPermission,
 } from "../acp/client";
 import type {
+  ModelOption,
   PermissionRequest,
   PlanEntry,
   SessionUpdate,
@@ -35,6 +36,8 @@ export type TimelineItem =
 
 export interface SessionState {
   sessionId: string | null;
+  /** Provider/model this session was created with; null = engine default. */
+  model: ModelOption | null;
   timeline: TimelineItem[];
   plan: PlanEntry[];
   busy: boolean;
@@ -42,7 +45,7 @@ export interface SessionState {
 }
 
 type Action =
-  | { type: "session_ready"; sessionId: string }
+  | { type: "session_ready"; sessionId: string; model: ModelOption | null }
   | { type: "user_prompt"; text: string }
   | { type: "acp_update"; update: SessionUpdate }
   | { type: "permission_request"; request: PermissionRequest }
@@ -55,6 +58,7 @@ const genId = () => `t${nextId++}`;
 
 const initial: SessionState = {
   sessionId: null,
+  model: null,
   timeline: [],
   plan: [],
   busy: false,
@@ -64,7 +68,7 @@ const initial: SessionState = {
 function reduce(state: SessionState, action: Action): SessionState {
   switch (action.type) {
     case "session_ready":
-      return { ...state, sessionId: action.sessionId };
+      return { ...state, sessionId: action.sessionId, model: action.model };
     case "user_prompt":
       return {
         ...state,
@@ -162,7 +166,13 @@ function appendText(
   };
 }
 
-export function useSession(cwd: string) {
+export function useSession(
+  cwd: string,
+  // Read once per session creation. A stable getter (not a value) so that
+  // changing the picker never tears down the running session — the choice
+  // only applies to the next session this hook creates.
+  getModelChoice?: () => ModelOption | null,
+) {
   const [state, dispatch] = useReducer(reduce, initial);
   const sessionRef = useRef<string | null>(null);
   sessionRef.current = state.sessionId;
@@ -173,9 +183,10 @@ export function useSession(cwd: string) {
 
     (async () => {
       try {
-        const id = await newSession(cwd);
+        const choice = getModelChoice?.() ?? null;
+        const id = await newSession(cwd, choice?.provider, choice?.model);
         if (disposed) return;
-        dispatch({ type: "session_ready", sessionId: id });
+        dispatch({ type: "session_ready", sessionId: id, model: choice });
         unsubs.push(
           await onSessionUpdate((n) => {
             if (n.sessionId === sessionRef.current) {
@@ -199,7 +210,7 @@ export function useSession(cwd: string) {
       disposed = true;
       unsubs.forEach((u) => u());
     };
-  }, [cwd]);
+  }, [cwd, getModelChoice]);
 
   const send = useCallback(async (text: string) => {
     const id = sessionRef.current;

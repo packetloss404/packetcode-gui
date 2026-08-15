@@ -77,6 +77,15 @@ export interface SessionSummary {
   costUsd: number;
 }
 
+// One selectable provider/model pair from `_packetcode/models/list`.
+// `default` marks the pair the engine uses when session/new carries no
+// override.
+export interface ModelOption {
+  provider: string;
+  model: string;
+  default: boolean;
+}
+
 export interface EngineProbe {
   found: boolean;
   path?: string;

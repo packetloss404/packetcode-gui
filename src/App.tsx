@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { probeEngine, startEngine } from "./acp/client";
-import type { EngineProbe } from "./acp/types";
+import { listModels, probeEngine, startEngine } from "./acp/client";
+import type { EngineProbe, ModelOption } from "./acp/types";
 import { Gate } from "./components/Gate";
 import { InstallGate } from "./components/InstallGate";
 import { SessionView } from "./components/SessionView";
@@ -17,6 +17,11 @@ export default function App() {
   const [phase, setPhase] = useState<Phase>({ name: "probing" });
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const onSessionReady = useCallback((id: string) => setActiveSessionId(id), []);
+  // Provider/model catalog from the engine, and the user's picker choice.
+  // The choice applies to the NEXT session; running sessions keep theirs.
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [modelChoice, setModelChoice] = useState<ModelOption | null>(null);
+  const onModelChoice = useCallback((m: ModelOption) => setModelChoice(m), []);
 
   const probe = useCallback(async () => {
     try {
@@ -28,6 +33,12 @@ export default function App() {
       } else {
         await startEngine();
         setPhase({ name: "ready", probe: result });
+        try {
+          setModels(await listModels());
+        } catch {
+          // Older engines have no catalog; the picker just stays inert.
+          setModels([]);
+        }
       }
     } catch (e) {
       setPhase({ name: "error", message: String(e) });
@@ -84,7 +95,13 @@ export default function App() {
         engineVersion={phase.probe.version ?? ""}
         activeSessionId={activeSessionId}
       />
-      <SessionView cwd={"."} onSessionReady={onSessionReady} />
+      <SessionView
+        cwd={"."}
+        onSessionReady={onSessionReady}
+        models={models}
+        modelChoice={modelChoice}
+        onModelChoice={onModelChoice}
+      />
     </div>
   );
 }
