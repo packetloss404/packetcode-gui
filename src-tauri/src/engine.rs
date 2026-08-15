@@ -53,6 +53,134 @@ struct DoctorReport {
     version: Option<String>,
 }
 
+/// The permission-mode vocabulary this client knows, in the engine's
+/// escalation order (packetcode/internal/acp/server.go `PermissionModes`).
+/// Used as the conservative fallback for engines that advertise no
+/// `permissionModes` list, so they keep offering exactly what they did before
+/// capability negotiation existed.
+pub const PERMISSION_MODES: [&str; 5] = ["ask", "accept-edits", "auto", "read-only", "bypass"];
+
+/// The engine's `agentCapabilities._packetcode` vendor extension block.
+///
+/// `advertised` is the load-bearing field: an engine that sent no
+/// `_packetcode` object at all (an older packetcode, or a third-party ACP
+/// agent) leaves every boolean `false`, and the frontend must NOT read those
+/// as "feature missing" — the call-time method-not-found fallbacks still
+/// decide. Only when `advertised` is true are the booleans authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PacketcodeCapabilities {
+    /// Whether the engine sent an `agentCapabilities._packetcode` object.
+    pub advertised: bool,
+    /// Gates `_packetcode/sessions/list`.
+    pub sessions_list: bool,
+    /// Gates `_packetcode/sessions/rename`.
+    pub sessions_rename: bool,
+    /// Gates `_packetcode/sessions/usage` and prompt-result enrichment.
+    pub sessions_usage: bool,
+    /// Gates `_packetcode/models/list`.
+    pub models_list: bool,
+    /// Modes `session/new` will accept. The engine trims this to the
+    /// operator's configured ceiling; anything above it fails -32602, so the
+    /// picker must offer exactly this set. Never empty: an engine that
+    /// advertises nothing (or garbage) yields all five.
+    pub permission_modes: Vec<String>,
+    /// Mode a `session/new` without an override resolves to, when the engine
+    /// says. `None` means "unknown" — the UI must not guess "ask".
+    pub default_permission_mode: Option<String>,
+}
+
+impl Default for PacketcodeCapabilities {
+    fn default() -> Self {
+        Self {
+            advertised: false,
+            sessions_list: false,
+            sessions_rename: false,
+            sessions_usage: false,
+            models_list: false,
+            permission_modes: PERMISSION_MODES.iter().map(|m| m.to_string()).collect(),
+            default_permission_mode: None,
+        }
+    }
+}
+
+/// What the engine advertised in its ACP `initialize` response. Retained from
+/// the handshake so the UI can offer only what the engine will actually
+/// accept, instead of discovering that from -32601/-32602 errors at call time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineCapabilities {
+    pub protocol_version: u64,
+    /// Spec capability: whether `session/load` may be used to resume.
+    pub load_session: bool,
+    pub packetcode: PacketcodeCapabilities,
+}
+
+/// Parses an ACP `initialize` result into [`EngineCapabilities`].
+///
+/// Every field is optional and unknown fields are ignored: the engine may be
+/// newer than this client, older than the capability block, or (in the limit)
+/// answer something malformed. Missing or unusable input degrades to the
+/// conservative defaults rather than failing the handshake.
+fn parse_capabilities(result: &Value) -> EngineCapabilities {
+    let agent = result.get("agentCapabilities").filter(|v| v.is_object());
+    let ext = agent
+        .and_then(|a| a.get("_packetcode"))
+        .filter(|v| v.is_object());
+    let flag = |name: &str| {
+        ext.and_then(|e| e.get(name))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+
+    // An absent, non-array, or empty list means "the engine did not say":
+    // keep all five so pre-capability engines behave exactly as before.
+    let permission_modes = ext
+        .and_then(|e| e.get("permissionModes"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            let mut modes: Vec<String> = Vec::with_capacity(items.len());
+            for mode in items.iter().filter_map(Value::as_str) {
+                let mode = mode.trim();
+                if !mode.is_empty() && !modes.iter().any(|m| m == mode) {
+                    modes.push(mode.to_string());
+                }
+            }
+            modes
+        })
+        .filter(|modes| !modes.is_empty())
+        .unwrap_or_else(|| PERMISSION_MODES.iter().map(|m| m.to_string()).collect());
+
+    // A default outside the advertised set is nonsense; drop it rather than
+    // let the UI preselect a mode session/new would reject.
+    let default_permission_mode = ext
+        .and_then(|e| e.get("defaultPermissionMode"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty() && permission_modes.iter().any(|m| m == mode))
+        .map(String::from);
+
+    EngineCapabilities {
+        protocol_version: result
+            .get("protocolVersion")
+            .and_then(Value::as_u64)
+            .unwrap_or(1),
+        load_session: agent
+            .and_then(|a| a.get("loadSession"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        packetcode: PacketcodeCapabilities {
+            advertised: ext.is_some(),
+            sessions_list: flag("sessionsList"),
+            sessions_rename: flag("sessionsRename"),
+            sessions_usage: flag("sessionsUsage"),
+            models_list: flag("modelsList"),
+            permission_modes,
+            default_permission_mode,
+        },
+    }
+}
+
 /// Sink for agent-initiated traffic. The Tauri layer forwards these to the
 /// webview as events; tests collect them directly.
 pub trait AcpEvents: Send + Sync + 'static {
@@ -292,6 +420,9 @@ pub struct EngineState {
     inner: Arc<Mutex<Option<Engine>>>,
     /// Binary path the last probe validated; engine_start spawns exactly this.
     resolved_binary: Arc<Mutex<Option<String>>>,
+    /// What the running engine advertised in `initialize`. `None` until the
+    /// handshake completes (and again after engine_stop).
+    capabilities: Arc<Mutex<Option<EngineCapabilities>>>,
 }
 
 struct Engine {
@@ -501,7 +632,7 @@ pub async fn start_engine(
     let stdout = child.stdout.take().ok_or("no stdout on engine process")?;
 
     let bridge = AcpBridge::start(stdin, stdout, sink);
-    bridge
+    let handshake = bridge
         .request(
             "initialize",
             json!({
@@ -512,6 +643,10 @@ pub async fn start_engine(
             REQUEST_TIMEOUT,
         )
         .await?;
+    // Keep what the engine advertised: the UI offers only the permission modes
+    // and extensions this engine will actually accept, instead of discovering
+    // them from -32601/-32602 errors at call time.
+    *state.capabilities.lock().await = Some(parse_capabilities(&handshake));
     *guard = Some(Engine { child, bridge });
     Ok(())
 }
@@ -523,6 +658,21 @@ pub async fn start_engine(
 /// degrades instead of failing.
 fn is_method_not_found(err: &str) -> bool {
     err.contains("-32601") || err.contains("Method not found")
+}
+
+/// Capabilities the running engine advertised. Before the handshake (or after
+/// a stop) this yields the conservative defaults — all five permission modes,
+/// nothing advertised — which is exactly how a pre-capability engine is
+/// treated, so callers never need a second set of fallbacks.
+pub async fn capabilities_of(state: &EngineState) -> EngineCapabilities {
+    state.capabilities.lock().await.clone().unwrap_or_default()
+}
+
+#[tauri::command]
+pub async fn engine_capabilities(
+    state: State<'_, EngineState>,
+) -> Result<EngineCapabilities, String> {
+    Ok(capabilities_of(&state).await)
 }
 
 /// Clones the bridge handle out of the state so protocol awaits never hold
@@ -1162,6 +1312,7 @@ pub async fn stop_on(state: &EngineState) -> Result<(), String> {
     if let Some(mut engine) = state.inner.lock().await.take() {
         let _ = engine.child.kill().await;
     }
+    *state.capabilities.lock().await = None;
     Ok(())
 }
 
@@ -1172,8 +1323,15 @@ pub async fn engine_stop(state: State<'_, EngineState>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{new_session_params, version_at_least};
-    use serde_json::json;
+    use super::{
+        new_session_params, parse_capabilities, version_at_least, PacketcodeCapabilities,
+        PERMISSION_MODES,
+    };
+    use serde_json::{json, Value};
+
+    fn modes(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
 
     #[test]
     fn version_gate() {
@@ -1214,5 +1372,110 @@ mod tests {
         // A mode alone still rides the extension object.
         let params = new_session_params("/w", None, None, Some("bypass".into()));
         assert_eq!(params["_packetcode"], json!({ "permissionMode": "bypass" }));
+    }
+
+    #[test]
+    fn capabilities_from_modern_engine() {
+        // A current engine started under a "read-only" ceiling: the vendor
+        // block is present, so its flags are authoritative and the advertised
+        // mode list is exactly what session/new will accept.
+        let caps = parse_capabilities(&json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "loadSession": true,
+                "promptCapabilities": { "image": false },
+                "mcpCapabilities": { "http": false },
+                "sessionCapabilities": {},
+                "_packetcode": {
+                    "sessionsList": true,
+                    "sessionsRename": true,
+                    "sessionsUsage": true,
+                    "modelsList": false,
+                    "permissionModes": ["ask", "read-only"],
+                    "defaultPermissionMode": "read-only",
+                    "somethingNewerThanThisClient": 7
+                }
+            },
+            "agentInfo": { "name": "packetcode", "version": "0.2.0" },
+            "authMethods": []
+        }));
+        assert_eq!(caps.protocol_version, 1);
+        assert!(caps.load_session);
+        assert!(caps.packetcode.advertised);
+        assert!(caps.packetcode.sessions_list);
+        assert!(caps.packetcode.sessions_rename);
+        assert!(caps.packetcode.sessions_usage);
+        assert!(!caps.packetcode.models_list);
+        assert_eq!(caps.packetcode.permission_modes, modes(&["ask", "read-only"]));
+        assert_eq!(
+            caps.packetcode.default_permission_mode.as_deref(),
+            Some("read-only")
+        );
+    }
+
+    #[test]
+    fn capabilities_from_pre_capability_engine() {
+        // An engine that predates the vendor block: nothing is advertised, so
+        // every extension flag stays false (the call-time -32601 fallbacks
+        // still apply) and all five permission modes remain on offer.
+        let caps = parse_capabilities(&json!({
+            "protocolVersion": 1,
+            "agentCapabilities": { "loadSession": true },
+            "agentInfo": { "name": "packetcode", "version": "0.1.0" }
+        }));
+        assert!(caps.load_session);
+        assert!(!caps.packetcode.advertised);
+        assert!(!caps.packetcode.sessions_list);
+        assert!(!caps.packetcode.sessions_rename);
+        assert!(!caps.packetcode.sessions_usage);
+        assert!(!caps.packetcode.models_list);
+        assert_eq!(caps.packetcode.permission_modes, modes(&PERMISSION_MODES));
+        assert_eq!(caps.packetcode.default_permission_mode, None);
+        // Identical to the state used before the handshake completes.
+        assert_eq!(caps.packetcode, PacketcodeCapabilities::default());
+    }
+
+    #[test]
+    fn capabilities_from_garbage_are_conservative() {
+        for garbage in [
+            Value::Null,
+            json!("not an object"),
+            json!({}),
+            json!({ "agentCapabilities": 42 }),
+            json!({ "agentCapabilities": { "loadSession": "yes", "_packetcode": [] } }),
+        ] {
+            let caps = parse_capabilities(&garbage);
+            assert_eq!(caps.protocol_version, 1, "for {garbage}");
+            assert!(!caps.load_session, "for {garbage}");
+            assert!(!caps.packetcode.advertised, "for {garbage}");
+            assert_eq!(
+                caps.packetcode.permission_modes,
+                modes(&PERMISSION_MODES),
+                "for {garbage}"
+            );
+        }
+
+        // Vendor block present but its contents are unusable: the block still
+        // counts as advertised (so the flags are authoritative and default to
+        // false), while an empty/garbage mode list falls back to all five and
+        // a default outside the advertised set is dropped.
+        let caps = parse_capabilities(&json!({
+            "agentCapabilities": {
+                "_packetcode": {
+                    "sessionsList": "true",
+                    "permissionModes": [1, null, "  ", "ask", "ask"],
+                    "defaultPermissionMode": "bypass"
+                }
+            }
+        }));
+        assert!(caps.packetcode.advertised);
+        assert!(!caps.packetcode.sessions_list);
+        assert_eq!(caps.packetcode.permission_modes, modes(&["ask"]));
+        assert_eq!(caps.packetcode.default_permission_mode, None);
+
+        let caps = parse_capabilities(&json!({
+            "agentCapabilities": { "_packetcode": { "permissionModes": [] } }
+        }));
+        assert_eq!(caps.packetcode.permission_modes, modes(&PERMISSION_MODES));
     }
 }

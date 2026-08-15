@@ -9,6 +9,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             engine::engine_probe,
             engine::engine_start,
+            engine::engine_capabilities,
             engine::engine_new_session,
             engine::engine_load_session,
             engine::engine_prompt,

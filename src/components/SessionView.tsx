@@ -18,6 +18,12 @@ export function SessionView(props: {
   onModelChoice: (m: ModelOption) => void;
   permissionMode: PermissionMode | null;
   onPermissionMode: (m: PermissionMode) => void;
+  /** Modes the engine will accept; null = it did not say, so offer all. */
+  allowedPermissionModes: string[] | null;
+  /** Mode a session with no override runs under; null = not advertised. */
+  engineDefaultMode: string | null;
+  /** False only when the engine advertised no usage extension. */
+  usageAvailable: boolean;
 }) {
   const { state, open, send, stop, answerPermission } = useSessions();
   // Latest picker choices, readable without retriggering session creation:
@@ -71,6 +77,21 @@ export function SessionView(props: {
           {entry?.error ? (
             <div className="thought">engine error: {entry.error}</div>
           ) : null}
+          {entry?.error && !entry.ready ? (
+            // The open gate reopened on failure, but re-selecting the same row
+            // yields the same target object and never re-runs the attach
+            // effect — without this the session is a permanent dead end.
+            <div>
+              <button
+                className="btn"
+                onClick={() =>
+                  open(key, target, cwd, choiceRef.current, modeRef.current)
+                }
+              >
+                Retry
+              </button>
+            </div>
+          ) : null}
         </div>
       </div>
       <Composer
@@ -85,6 +106,8 @@ export function SessionView(props: {
         sessionPermissionMode={entry?.permissionMode ?? null}
         permissionMode={props.permissionMode}
         onPermissionMode={props.onPermissionMode}
+        allowedPermissionModes={props.allowedPermissionModes}
+        engineDefaultMode={props.engineDefaultMode}
         usage={entry?.usage ?? null}
       />
     </section>

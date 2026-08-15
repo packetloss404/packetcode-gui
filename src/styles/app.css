@@ -301,6 +301,13 @@ code {
 .mode-opt-label { font-weight: 650; }
 .mode-opt.tone-red .mode-opt-label { color: var(--color-accent-red); }
 .mode-opt-desc { font-size: 0.68rem; font-weight: 400; color: var(--color-text-faint); }
+.mode-opt-default {
+  font-size: 0.6rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--color-text-faint);
+}
 .mode-opt-warning {
   font-size: 0.68rem; font-weight: 500;
   color: var(--color-accent-red); margin-top: 2px;

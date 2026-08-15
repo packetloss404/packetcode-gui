@@ -147,8 +147,9 @@ export function usageStatusline(usage: SessionUsage | null): string | null {
   return segments.length > 0 ? segments.join(" · ") : null;
 }
 
-/** The five per-session permission modes, in escalation order. Tones map to
- * the semantic accents in tokens.css. */
+/** The permission-mode vocabulary this client can render, in escalation
+ * order. Which of these are actually OFFERED is decided by the engine's
+ * advertised list; tones map to the semantic accents in tokens.css. */
 const PERMISSION_MODES: Array<{
   id: PermissionMode;
   label: string;
@@ -190,6 +191,11 @@ const PERMISSION_MODES: Array<{
 const modeInfo = (id: PermissionMode) =>
   PERMISSION_MODES.find((m) => m.id === id) ?? PERMISSION_MODES[1];
 
+/** Renderable metadata for an engine-advertised mode id, or null when the
+ * engine named something this client has no wording for. */
+const knownMode = (id: string | null) =>
+  PERMISSION_MODES.find((m) => m.id === id) ?? null;
+
 export function Composer(props: {
   busy: boolean;
   onSend: (text: string) => void;
@@ -205,11 +211,18 @@ export function Composer(props: {
   projectDir: string | null;
   /** Blocks input entirely (no project selected). */
   disabled?: boolean;
-  /** Mode the ACTIVE session was created with; null = engine default (ask). */
+  /** Mode the ACTIVE session was created with; null = the engine's default. */
   sessionPermissionMode: PermissionMode | null;
-  /** Pending mode for the NEXT session; null = engine default (ask). */
+  /** Pending mode for the NEXT session; null = the engine's default. */
   permissionMode: PermissionMode | null;
   onPermissionMode: (m: PermissionMode) => void;
+  /** Modes `session/new` accepts, from the initialize handshake. Anything
+   * outside this set fails -32602, so it must not be offered. Null means the
+   * engine did not say and all known modes stay available. */
+  allowedPermissionModes: string[] | null;
+  /** Mode a session with no override resolves to; null when not advertised —
+   * the chip then says "engine default" instead of naming a mode. */
+  engineDefaultMode: string | null;
   /** Token/cost usage for the ACTIVE session; null hides the statusline. */
   usage: SessionUsage | null;
 }) {
@@ -369,10 +382,28 @@ export function Composer(props: {
     setPickerOpen(false);
   };
 
-  // The chip reflects the mode the active session actually runs under; the
-  // checkmark reflects what the next session will use. Engine default is ask.
-  const activeMode = modeInfo(props.sessionPermissionMode ?? "ask");
-  const pendingMode = props.permissionMode ?? "ask";
+  // Only advertised modes are offered — requesting a mode above the engine's
+  // ceiling fails -32602. An engine that named only modes this client cannot
+  // render falls back to the full list rather than an empty menu.
+  const allowed = props.allowedPermissionModes;
+  const offered =
+    allowed === null
+      ? PERMISSION_MODES
+      : PERMISSION_MODES.filter((m) => allowed.includes(m.id));
+  const modes = offered.length > 0 ? offered : PERMISSION_MODES;
+  const restricted = modes.length < PERMISSION_MODES.length;
+
+  // The chip reflects the mode the active session actually runs under: its
+  // explicit override, else the engine's advertised default. When the engine
+  // advertises no default there is nothing honest to name, so the chip says
+  // "engine default" rather than claiming "Ask".
+  const engineDefault = knownMode(props.engineDefaultMode);
+  const activeMode =
+    props.sessionPermissionMode !== null
+      ? modeInfo(props.sessionPermissionMode)
+      : engineDefault;
+  // The checkmark reflects what the next session will use.
+  const pendingMode = props.permissionMode ?? engineDefault?.id ?? null;
 
   const chooseMode = (m: PermissionMode) => {
     props.onPermissionMode(m);
@@ -448,7 +479,9 @@ export function Composer(props: {
                     );
                     return;
                   }
-                  if (e.key === "Enter" || e.key === "Tab") {
+                  // Shift+Enter is always a newline, menu open or not — an
+                  // open completion menu must not swallow it.
+                  if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
                     e.preventDefault();
                     accept(menuItems[activeIndex]);
                     return;
@@ -506,12 +539,14 @@ export function Composer(props: {
           <div className="composer-row">
             <div className="mode-picker">
               <button
-                className={`mode-chip tone-${activeMode.tone}`}
+                className={
+                  activeMode ? `mode-chip tone-${activeMode.tone}` : "mode-chip"
+                }
                 onClick={() => setModeOpen((open) => !open)}
                 aria-haspopup="listbox"
                 aria-expanded={modeOpen}
               >
-                {activeMode.label}
+                {activeMode ? activeMode.label : "Engine default"}
                 <span className="mode-caret">▾</span>
               </button>
               {modeOpen ? (
@@ -523,8 +558,9 @@ export function Composer(props: {
                   <div className="model-pop mode-pop" role="listbox">
                     <div className="model-pop-hint">
                       Permission mode — applies to new sessions
+                      {restricted ? " · limited by the engine" : ""}
                     </div>
-                    {PERMISSION_MODES.map((m) => {
+                    {modes.map((m) => {
                       const selected = m.id === pendingMode;
                       return (
                         <button
@@ -542,6 +578,11 @@ export function Composer(props: {
                           <span className="mode-opt-body">
                             <span className="mode-opt-label">{m.label}</span>
                             <span className="mode-opt-desc">{m.desc}</span>
+                            {engineDefault !== null && m.id === engineDefault.id ? (
+                              <span className="mode-opt-default">
+                                engine default
+                              </span>
+                            ) : null}
                             {m.id === "bypass" ? (
                               <span className="mode-opt-warning">
                                 No approval prompts at all — only for
@@ -565,63 +606,71 @@ export function Composer(props: {
               </button>
             ) : null}
             <div className="composer-right">
-              <div className="model-picker">
-                <button
-                  className="model-btn"
-                  disabled={!hasCatalog}
-                  onClick={() => setPickerOpen((open) => !open)}
-                  aria-haspopup="listbox"
-                  aria-expanded={pickerOpen}
-                >
-                  <span className="model-label">
-                    {active ? (
-                      <>
-                        <span className="model-provider">{active.provider}</span>{" "}
-                        <b>{active.model}</b>
-                      </>
-                    ) : (
-                      <b>engine default</b>
-                    )}
-                  </span>
-                  {hasCatalog ? <span className="model-caret">▾</span> : null}
-                </button>
-                {pickerOpen && hasCatalog ? (
-                  <>
-                    <div
-                      className="model-backdrop"
-                      onClick={() => setPickerOpen(false)}
-                    />
-                    <div className="model-pop" role="listbox">
-                      <div className="model-pop-hint">
-                        Applies to new sessions
+              {/* Without a catalog there is nothing to pick FROM, but the
+                  session still knows what it runs ON (session/new answers with
+                  it), and hiding that read-out would lose information the
+                  older-engine fallback successfully produced. So: show the
+                  chip whenever there is a model to name, and only make it
+                  interactive when a catalog exists. */}
+              {hasCatalog || active ? (
+                <div className="model-picker">
+                  <button
+                    className="model-btn"
+                    disabled={!hasCatalog}
+                    onClick={() => hasCatalog && setPickerOpen((open) => !open)}
+                    aria-haspopup="listbox"
+                    aria-expanded={pickerOpen}
+                  >
+                    <span className="model-label">
+                      {active ? (
+                        <>
+                          <span className="model-provider">{active.provider}</span>{" "}
+                          <b>{active.model}</b>
+                        </>
+                      ) : (
+                        <b>engine default</b>
+                      )}
+                    </span>
+                    {hasCatalog ? <span className="model-caret">▾</span> : null}
+                  </button>
+                  {pickerOpen && hasCatalog ? (
+                    <>
+                      <div
+                        className="model-backdrop"
+                        onClick={() => setPickerOpen(false)}
+                      />
+                      <div className="model-pop" role="listbox">
+                        <div className="model-pop-hint">
+                          Applies to new sessions
+                        </div>
+                        {props.models.map((m) => {
+                          const selected =
+                            pending !== null && optionKey(m) === optionKey(pending);
+                          return (
+                            <button
+                              key={optionKey(m)}
+                              className={
+                                selected ? "model-opt selected" : "model-opt"
+                              }
+                              role="option"
+                              aria-selected={selected}
+                              onClick={() => choose(m)}
+                            >
+                              <span className="model-opt-provider">
+                                {m.provider}
+                              </span>
+                              <span className="model-opt-model">{m.model}</span>
+                              {selected ? (
+                                <span className="model-opt-check">✓</span>
+                              ) : null}
+                            </button>
+                          );
+                        })}
                       </div>
-                      {props.models.map((m) => {
-                        const selected =
-                          pending !== null && optionKey(m) === optionKey(pending);
-                        return (
-                          <button
-                            key={optionKey(m)}
-                            className={
-                              selected ? "model-opt selected" : "model-opt"
-                            }
-                            role="option"
-                            aria-selected={selected}
-                            onClick={() => choose(m)}
-                          >
-                            <span className="model-opt-provider">
-                              {m.provider}
-                            </span>
-                            <span className="model-opt-model">{m.model}</span>
-                            {selected ? (
-                              <span className="model-opt-check">✓</span>
-                            ) : null}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </>
-                ) : null}
-              </div>
+                    </>
+                  ) : null}
+                </div>
+              ) : null}
               <button
                 className="send-btn"
                 onClick={submit}

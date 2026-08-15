@@ -4,6 +4,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  EngineCapabilities,
   EngineProbe,
   ModelOption,
   PermissionMode,
@@ -21,6 +22,13 @@ export function probeEngine(): Promise<EngineProbe> {
 
 export function startEngine(): Promise<void> {
   return invoke("engine_start");
+}
+
+/** What the running engine advertised in its ACP `initialize` handshake.
+ * Always resolves once the engine has started: an engine that advertised
+ * nothing yields conservative defaults rather than an error. */
+export function engineCapabilities(): Promise<EngineCapabilities> {
+  return invoke<EngineCapabilities>("engine_capabilities");
 }
 
 export function newSession(

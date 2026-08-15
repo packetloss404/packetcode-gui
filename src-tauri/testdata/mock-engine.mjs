@@ -30,7 +30,7 @@ if (args[0] === "doctor") {
 
 if (args[0] !== "acp") {
   process.stderr.write(
-    "usage: mock-engine.mjs <doctor --json | acp> [--no-usage] [--no-affordances]\n"
+    "usage: mock-engine.mjs <doctor --json | acp> [--no-usage] [--no-affordances] [--restricted-caps]\n"
   );
   process.exit(2);
 }
@@ -55,6 +55,12 @@ const slashCommands = [
   },
 ];
 const projectFiles = ["src/App.tsx", "src/components/Composer.tsx"];
+// --restricted-caps simulates a current engine started under a permission
+// ceiling and with some extensions switched off: initialize carries an
+// agentCapabilities._packetcode block advertising a trimmed mode list and a
+// mix of extension flags. Without the flag the mock advertises no vendor
+// block at all, exactly like an engine predating capability negotiation.
+const restrictedCaps = args.includes("--restricted-caps");
 // Static usage served by the extension and attached to end_turn prompt
 // results, mirroring the real engine's enrichment.
 const sessionUsage = {
@@ -273,7 +279,24 @@ function handleLine(line) {
         id,
         result: {
           protocolVersion: 1,
-          agentCapabilities: { loadSession: false },
+          agentCapabilities: restrictedCaps
+            ? {
+                loadSession: true,
+                promptCapabilities: { image: false, audio: false },
+                _packetcode: {
+                  sessionsList: true,
+                  sessionsRename: false,
+                  sessionsUsage: !noUsage,
+                  modelsList: false,
+                  // Operator ceiling of "ask": nothing more permissive is
+                  // offered, and session/new would reject it with -32602.
+                  permissionModes: ["ask", "read-only"],
+                  defaultPermissionMode: "read-only",
+                  // A field this client has never heard of; must be ignored.
+                  futureExtension: { enabled: true },
+                },
+              }
+            : { loadSession: false },
           agentInfo: { name: "mock", version: "0.1.0" },
         },
       });

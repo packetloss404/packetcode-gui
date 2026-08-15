@@ -76,12 +76,17 @@ const SessionsContext = createContext<SessionsApi | null>(null);
  * rejection last). Never an "allow": an unattributable request must not be
  * granted on the user's behalf. */
 function rejectionOption(request: PermissionRequest): string | null {
-  const reject = request.options.find(
-    (o) => o.kind.startsWith("reject") || o.optionId.startsWith("reject"),
+  // Defensive: a newer engine may omit `kind`, and throwing here would run
+  // inside the event listener — leaving the engine blocked forever, the exact
+  // failure this path exists to prevent. Never guess positionally either: an
+  // engine whose options we cannot classify gets no answer from us rather
+  // than a coin-flip that might be an ALLOW.
+  const reject = (request.options ?? []).find(
+    (o) =>
+      (typeof o?.kind === "string" && o.kind.startsWith("reject")) ||
+      (typeof o?.optionId === "string" && o.optionId.startsWith("reject")),
   );
-  if (reject) return reject.optionId;
-  const last = request.options[request.options.length - 1];
-  return last ? last.optionId : null;
+  return reject ? reject.optionId : null;
 }
 
 export function SessionsProvider(props: { children: ReactNode }) {

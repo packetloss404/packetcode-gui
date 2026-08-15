@@ -38,6 +38,9 @@ export function Sidebar(props: {
   onSelectProject: (dir: string) => void;
   /** Tell the shell the list changed (e.g. after an inline rename). */
   onSessionsChanged: () => void;
+  /** False when the engine advertised no `_packetcode/sessions/rename`: the
+   * rename affordance is hidden rather than silently doing nothing. */
+  canRenameSessions: boolean;
 }) {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -176,10 +179,14 @@ export function Sidebar(props: {
               }
               // Renaming a RESIDENT session is disabled: its live runtime
               // rewrites the whole session file on the next save, which can
-              // both revert the name and clobber concurrent writes. Residency,
-              // not selection, is the test now — several sessions are live at
-              // once and only one of them is on screen.
-              const canRename = status === undefined;
+              // Renaming a session with a LIVE TURN is disabled: its runtime
+              // rewrites the whole session file on the next save, which can
+              // both revert the name and clobber concurrent writes. Merely
+              // having visited a session does not block renaming it — only an
+              // active turn does. Engines without the rename extension hide
+              // the affordance entirely.
+              const busy = status === "running" || status === "attention";
+              const canRename = !busy && props.canRenameSessions;
               const attention = status === "attention";
               return (
                 <button

@@ -371,7 +371,12 @@ function applyUpdate(entry: SessionEntry, update: SessionUpdate): SessionEntry {
             ? {
                 ...item,
                 status: update.status ?? item.status,
-                output: chunk ? item.output + chunk : item.output,
+                // The engine sends the CUMULATIVE output preview on every
+                // tool_call_update (already tail-trimmed to its own cap), so
+                // this replaces rather than appends. Appending made a k-chunk
+                // tool cost the sum of every prefix — tens of MB for a chatty
+                // one — and the store now outlives the view that showed it.
+                output: chunk ? chunk : item.output,
               }
             : item,
         ),
