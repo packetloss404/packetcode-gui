@@ -258,6 +258,12 @@ code {
   min-height: 40px;
 }
 .input-card textarea::placeholder { color: var(--color-text-faint); }
+
+/* Anchors the autocomplete popover to the textarea so it opens above the
+   input rather than above the whole card. The popover itself is styled after
+   the model picker, below, and must stay after it in source order to win the
+   cascade on `right`. */
+.ac-anchor { position: relative; }
 .composer-row { display: flex; align-items: center; gap: 10px; font-size: 0.8rem; color: var(--color-text-secondary); }
 .mode-chip {
   display: flex; align-items: center; gap: 6px;
@@ -339,6 +345,32 @@ code {
 .model-opt-provider { color: var(--color-text-faint); font-size: 0.68rem; min-width: 62px; flex: none; }
 .model-opt-model { overflow-wrap: anywhere; }
 .model-opt-check { margin-left: auto; padding-left: 8px; color: var(--color-accent-green); }
+
+/* ── Composer autocomplete (/ commands, @ files) ───────── */
+/* Reuses .model-pop's chrome; only anchoring and width differ, so this must
+   follow .model-pop to override its right-alignment. Unlike the two
+   button-triggered pickers there is no .model-backdrop — a full-screen
+   click-catcher would steal focus from the textarea being completed. */
+.ac-pop { left: 0; right: auto; min-width: 280px; max-width: 100%; }
+.ac-opt {
+  display: flex; align-items: baseline; gap: 8px; width: 100%;
+  background: none; border: none; border-radius: 6px;
+  padding: 5px 9px; cursor: pointer; text-align: left;
+  font-size: 0.76rem; color: var(--color-text-secondary);
+}
+/* .active is the keyboard cursor; hover mirrors it, and hovering also moves
+   the cursor, so the menu never shows two highlights at once. */
+.ac-opt:hover, .ac-opt.active {
+  background: var(--color-bg-hover); color: var(--color-text-primary);
+}
+.ac-opt.active { font-weight: 650; }
+.ac-opt-label { font-family: var(--font-mono); overflow-wrap: anywhere; }
+.ac-opt-hint { color: var(--color-text-faint); font-size: 0.68rem; flex: none; }
+.ac-opt-desc {
+  margin-left: auto; padding-left: 10px;
+  color: var(--color-text-faint); font-size: 0.68rem; font-weight: 400;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .send-btn {
   width: 26px; height: 26px; border-radius: 50%;
   background: var(--color-accent-green); border: none;

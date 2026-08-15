@@ -118,6 +118,19 @@ export interface ModelOption {
   default: boolean;
 }
 
+// One invocable slash command from `_packetcode/commands/list`. `source` says
+// where it came from; today's engine reports only markdown commands under
+// ~/.packetcode/commands ("user") and <cwd>/.packetcode/commands ("project"),
+// since its built-in slash commands are TUI affordances with no ACP
+// equivalent. `argumentHint` is a short usage tail such as "[arguments]" and
+// is absent for commands that take none.
+export interface SlashCommand {
+  name: string;
+  description: string;
+  source: "builtin" | "user" | "project";
+  argumentHint?: string;
+}
+
 export interface EngineProbe {
   found: boolean;
   path?: string;

@@ -71,7 +71,11 @@ Vendor extensions (feature-detected via `agentCapabilities._packetcode` in the `
 | `_packetcode/sessions/rename` | Inline session rename from the sidebar |
 | `_packetcode/sessions/usage` | Token/cost usage for the statusline (newer engines also attach usage to prompt results) |
 | `_packetcode/models/list` | Provider/model catalog for the picker |
+| `_packetcode/commands/list` | Slash commands for the composer's `/` menu. The engine reports only markdown commands from `~/.packetcode/commands` and `<cwd>/.packetcode/commands`; its built-in slash commands are TUI affordances with no ACP equivalent. It expands a leading `/name` in `session/prompt` into the command's prompt |
+| `_packetcode/project/files` | Project file search for the composer's `@` menu, using the engine's own ignore rules |
 | `session/new` `_packetcode: {provider, model, permissionMode}` | Per-session model and permission-mode overrides (the engine caps requested modes at its configured profile) |
+
+Both composer affordances degrade to an empty list on engines without them, and the composer's placeholder drops the promises it cannot keep — down to a bare "Do anything" when neither is served.
 
 Minimum engine version: `MINIMUM_ENGINE_VERSION` in `src-tauri/src/engine.rs`. packetcode keeps the ACP surface additive; the app must degrade, not crash, when a method is missing.
 

@@ -12,6 +12,7 @@ import type {
   SessionNotification,
   SessionSummary,
   SessionUsage,
+  SlashCommand,
 } from "./types";
 
 export function probeEngine(): Promise<EngineProbe> {
@@ -69,6 +70,20 @@ export function renameSession(sessionId: string, name: string): Promise<void> {
 
 export function listModels(): Promise<ModelOption[]> {
   return invoke<ModelOption[]>("engine_list_models");
+}
+
+/** Slash commands available in `cwd` via `_packetcode/commands/list`. Engines
+ * that predate the extension answer method-not-found, which the bridge maps to
+ * an empty list — so an empty result means "no / menu", not "no commands yet". */
+export function listCommands(cwd: string): Promise<SlashCommand[]> {
+  return invoke<SlashCommand[]>("engine_list_commands", { cwd });
+}
+
+/** Project files matching `query` via `_packetcode/project/files`, ranked
+ * best-match first and capped by the bridge. Same degradation as
+ * listCommands: an empty list on engines without the extension. */
+export function searchFiles(cwd: string, query: string): Promise<string[]> {
+  return invoke<string[]>("engine_search_files", { cwd, query });
 }
 
 export function installEngine(): Promise<void> {
