@@ -22,10 +22,41 @@ use tokio::time::{timeout, Duration};
 pub const MINIMUM_ENGINE_VERSION: &str = "0.1.0";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// The engine's own budget for starting a session's MCP fleet:
+/// `context.WithTimeout(ctx, 30*time.Second)` in packetcode's
+/// `packetACPFactory.startMCP` (cmd/packetcode/acp.go). Mirrored here only so
+/// [`NEW_SESSION_TIMEOUT`] can be derived from it rather than guessed; keep the
+/// two in step if the engine ever changes its cap.
+const ENGINE_MCP_STARTUP_CEILING: Duration = Duration::from_secs(30);
+/// `session/new` must outlast the engine's WORST legal case, not its typical
+/// one. The engine spends up to [`ENGINE_MCP_STARTUP_CEILING`] starting this
+/// session's MCP servers and only then builds the provider registry and
+/// persists the session, so a client budget equal to that ceiling always loses
+/// the race whenever MCP startup runs long — and loses it in the worst
+/// possible way: the engine finishes moments later and registers a live
+/// session the GUI has already given up on. Three times the ceiling leaves
+/// room for the work layered on top while still failing fast enough to be a
+/// visible error rather than a hang. (`session/load` carries its own, larger
+/// [`LOAD_TIMEOUT`] for the same class of reason.)
+///
+/// Expressed as a multiple rather than a literal so the two cannot drift apart
+/// unnoticed; `session_new_budget_clears_the_engine_ceiling` pins the rule.
+const NEW_SESSION_TIMEOUT: Duration = ENGINE_MCP_STARTUP_CEILING.saturating_mul(3);
 /// `session/load` replays a whole transcript before resolving.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// `session/prompt` runs an entire agent turn; give it room.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// How long a graceful stop waits for the engine to exit after its stdin is
+/// closed. Closing stdin is the only way a packetcode engine is asked to shut
+/// down: its ACP loop returns when the stdin scanner hits EOF, and only then
+/// does `Server.shutdown` (packetcode/internal/acp/server.go) cancel the live
+/// turns and run `Runtime.Close` for every session — which is what releases
+/// each session's resources, and the MCP child processes it spawned. Seconds,
+/// not minutes: a wedged engine must never hold up app exit.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Bound on each forced-termination step, so a stop always returns even when
+/// the OS is slow to reap.
+const KILL_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -215,15 +246,23 @@ pub struct AcpBridge {
     /// ("packetcode-permission-1"), so the raw id Value is stored and echoed
     /// back verbatim in the reply frame.
     permission_waiters: Mutex<HashMap<String, PendingPermission>>,
-    stdin: Mutex<ChildStdin>,
+    /// The engine's stdin, or `None` once [`AcpBridge::close_stdin`] has
+    /// dropped it to ask the engine to shut down. Writes after that fail
+    /// cleanly instead of pretending the pipe is still there.
+    stdin: Mutex<Option<ChildStdin>>,
 }
 
 /// One unanswered `session/request_permission`. The session id is kept next to
 /// the raw JSON-RPC id because sessions run concurrently: cancelling one
 /// session must answer only ITS outstanding requests and leave another
 /// session's request waiting for the user.
+///
+/// `session_id` is `None` for a malformed request that named no session. Such
+/// a waiter is deliberately unmatchable by any session-scoped sweep — an empty
+/// id must never behave as a wildcard — while staying answerable by request
+/// id, and it is still cleared when the engine goes away.
 struct PendingPermission {
-    session_id: String,
+    session_id: Option<String>,
     raw_id: Value,
 }
 
@@ -239,7 +278,7 @@ impl AcpBridge {
             next_request_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             permission_waiters: Mutex::new(HashMap::new()),
-            stdin: Mutex::new(stdin),
+            stdin: Mutex::new(Some(stdin)),
         });
         let reader = bridge.clone();
         tokio::spawn(async move {
@@ -292,11 +331,15 @@ impl AcpBridge {
                 let Some(rpc_id) = msg.get("id").cloned() else {
                     return;
                 };
+                // Blank or absent is stored as None, never "": an empty
+                // string would otherwise be swept by a stray
+                // `cancel_session("")` and answer a request nobody meant.
                 let session_id = msg
                     .pointer("/params/sessionId")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(String::from);
                 self.permission_waiters.lock().await.insert(
                     rpc_id.to_string(),
                     PendingPermission {
@@ -319,12 +362,24 @@ impl AcpBridge {
     async fn write_line(&self, frame: &Value) -> Result<(), String> {
         let mut line = frame.to_string();
         line.push('\n');
-        self.stdin
-            .lock()
-            .await
+        let mut guard = self.stdin.lock().await;
+        let stdin = guard.as_mut().ok_or("engine stdin is closed")?;
+        stdin
             .write_all(line.as_bytes())
             .await
             .map_err(|e| format!("engine write failed: {e}"))
+    }
+
+    /// Flushes and closes the engine's stdin — the shutdown signal a
+    /// packetcode engine actually listens for (see [`SHUTDOWN_GRACE`]).
+    /// Idempotent: a second call is a no-op, and every later write fails with
+    /// "engine stdin is closed" instead of blocking on a dead pipe.
+    pub async fn close_stdin(&self) {
+        if let Some(mut stdin) = self.stdin.lock().await.take() {
+            // Flush what is buffered, then drop the handle: the drop is what
+            // actually closes the pipe and lets the engine's scanner return.
+            let _ = stdin.shutdown().await;
+        }
     }
 
     /// Sends a request and awaits its response. The stdin lock is held only
@@ -362,28 +417,82 @@ impl AcpBridge {
             .await
     }
 
+    /// Removes every waiter belonging to `session_id` and returns their raw
+    /// JSON-RPC ids, so the caller can decide whether they still deserve a
+    /// reply. Scoped by session on purpose: other sessions' turns are still
+    /// running and still need the user's answer.
+    ///
+    /// A blank `session_id` matches nothing, including waiters recorded from a
+    /// request that named no session (those hold `None`).
+    async fn take_session_waiters(&self, session_id: &str) -> Vec<Value> {
+        if session_id.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut waiters = self.permission_waiters.lock().await;
+        let doomed: Vec<String> = waiters
+            .iter()
+            .filter(|(_, pending)| pending.session_id.as_deref() == Some(session_id))
+            .map(|(key, _)| key.clone())
+            .collect();
+        doomed
+            .into_iter()
+            .filter_map(|key| waiters.remove(&key).map(|pending| pending.raw_id))
+            .collect()
+    }
+
+    /// Runs one `session/prompt` turn and reaps the session's unanswered
+    /// permission waiters once it resolves, whatever the outcome.
+    ///
+    /// Permission requests only ever arise inside a turn, and the engine runs
+    /// at most one turn per session (internal/acp/server.go keeps a per-session
+    /// `active` flag), so once the prompt request resolves — end_turn,
+    /// cancelled, an engine-side error, or our own timeout — anything still
+    /// parked for this session belongs to the turn that just ended and will
+    /// never be answered. Without this, a turn that ends by any route OTHER
+    /// than a reply or a cancel (agent-side context cancel, engine internal
+    /// error, an error event) leaks its waiter for the life of the process,
+    /// and a later cancel answers a request the engine no longer has pending.
+    ///
+    /// The waiters are dropped WITHOUT a reply: the engine has already stopped
+    /// waiting on them, so a late "cancelled" response would be nothing but an
+    /// unknown-id line in its log.
+    pub async fn prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        wait: Duration,
+    ) -> Result<Value, String> {
+        let result = self
+            .request(
+                "session/prompt",
+                json!({
+                    "sessionId": session_id,
+                    "prompt": [{ "type": "text", "text": text }]
+                }),
+                wait,
+            )
+            .await;
+        self.take_session_waiters(session_id).await;
+        result
+    }
+
     /// Cancels a session turn: sends `session/cancel` and answers THIS
     /// session's outstanding permission requests with a `cancelled` outcome
     /// (the ACP contract on cancellation). Late `permission_reply` calls for
     /// those requests then fail cleanly instead of double-answering the agent.
     /// Other sessions' requests are left pending — they belong to turns that
     /// are still running and still need the user's answer.
+    ///
+    /// A blank session id is rejected outright rather than broadcast: the
+    /// engine has no such session, and sweeping on "" would be a wildcard over
+    /// waiters that merely failed to name one.
     pub async fn cancel_session(&self, session_id: &str) -> Result<(), String> {
+        if session_id.trim().is_empty() {
+            return Err("session/cancel needs a session id".to_string());
+        }
         self.notify("session/cancel", json!({ "sessionId": session_id }))
             .await?;
-        let stale: Vec<Value> = {
-            let mut waiters = self.permission_waiters.lock().await;
-            let doomed: Vec<String> = waiters
-                .iter()
-                .filter(|(_, pending)| pending.session_id == session_id)
-                .map(|(key, _)| key.clone())
-                .collect();
-            doomed
-                .into_iter()
-                .filter_map(|key| waiters.remove(&key).map(|pending| pending.raw_id))
-                .collect()
-        };
-        for id in stale {
+        for id in self.take_session_waiters(session_id).await {
             let _ = self
                 .write_line(&json!({
                     "jsonrpc": "2.0",
@@ -742,7 +851,7 @@ pub async fn new_session_on(
     let params = new_session_params(&abs, provider, model, permission_mode);
     let result = bridge_of(state)
         .await?
-        .request("session/new", params, REQUEST_TIMEOUT)
+        .request("session/new", params, NEW_SESSION_TIMEOUT)
         .await?;
     result
         .get("sessionId")
@@ -832,14 +941,7 @@ pub async fn prompt_on(
 ) -> Result<PromptOutcome, String> {
     let result = bridge_of(state)
         .await?
-        .request(
-            "session/prompt",
-            json!({
-                "sessionId": session_id,
-                "prompt": [{ "type": "text", "text": text }]
-            }),
-            PROMPT_TIMEOUT,
-        )
+        .prompt(session_id, text, PROMPT_TIMEOUT)
         .await?;
     let stop_reason = result
         .get("stopReason")
@@ -1274,21 +1376,26 @@ pub async fn engine_install(app: AppHandle, state: State<'_, EngineState>) -> Re
     Ok(())
 }
 
-/// Best-effort kill of the installer and everything it spawned. kill_on_drop
-/// only terminates powershell itself; Windows needs an explicit tree kill.
-async fn kill_process_tree(child: &Child) {
+/// Best-effort kill of a child and everything it spawned. `Child::kill` (and
+/// `kill_on_drop`) only terminates the child itself; Windows needs an explicit
+/// tree kill, or the engine's MCP servers and the installer's sub-shells
+/// survive it. Returns whether a tree kill was actually attempted, so callers
+/// know whether waiting for the child to fall over is worth the time.
+async fn kill_process_tree(child: &Child) -> bool {
     if !cfg!(windows) {
-        return;
+        return false;
     }
-    if let Some(pid) = child.id() {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
+    let Some(pid) = child.id() else {
+        return false;
+    };
+    Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok()
 }
 
 async fn stream_install_output(app: AppHandle, pipe: impl tokio::io::AsyncRead + Unpin) {
@@ -1309,10 +1416,41 @@ async fn stream_install_output(app: AppHandle, pipe: impl tokio::io::AsyncRead +
 }
 
 pub async fn stop_on(state: &EngineState) -> Result<(), String> {
-    if let Some(mut engine) = state.inner.lock().await.take() {
-        let _ = engine.child.kill().await;
-    }
+    stop_engine(state, SHUTDOWN_GRACE).await
+}
+
+/// Shuts the engine down, escalating only as far as it has to:
+///
+/// 1. close stdin — the engine's ACP loop returns on EOF and runs its own
+///    `Server.shutdown`, cancelling live turns and closing every session
+///    runtime (and with it the MCP children those sessions spawned);
+/// 2. wait up to `grace` for it to exit by itself;
+/// 3. tree-kill it, because on Windows nothing else reaps its descendants;
+/// 4. kill the engine process directly, as the last resort.
+///
+/// The old behaviour was step 4 alone, which denied the engine any chance to
+/// release what it owned. Every step here is bounded, so a wedged engine costs
+/// at most `grace + 2 * KILL_GRACE` and can never block app exit; `grace` is a
+/// parameter purely so tests can exercise the fallback path quickly.
+pub async fn stop_engine(state: &EngineState, grace: Duration) -> Result<(), String> {
+    let engine = state.inner.lock().await.take();
     *state.capabilities.lock().await = None;
+    let Some(mut engine) = engine else {
+        return Ok(());
+    };
+
+    engine.bridge.close_stdin().await;
+    if timeout(grace, engine.child.wait()).await.is_ok() {
+        return Ok(());
+    }
+    if kill_process_tree(&engine.child).await
+        && timeout(KILL_GRACE, engine.child.wait()).await.is_ok()
+    {
+        return Ok(());
+    }
+    // Bounded even here: `kill` awaits the reap, and a stop that cannot
+    // complete must still return. `kill_on_drop` remains the final backstop.
+    let _ = timeout(KILL_GRACE, engine.child.kill()).await;
     Ok(())
 }
 
@@ -1325,7 +1463,8 @@ pub async fn engine_stop(state: State<'_, EngineState>) -> Result<(), String> {
 mod tests {
     use super::{
         new_session_params, parse_capabilities, version_at_least, PacketcodeCapabilities,
-        PERMISSION_MODES,
+        ENGINE_MCP_STARTUP_CEILING, KILL_GRACE, LOAD_TIMEOUT, NEW_SESSION_TIMEOUT,
+        PERMISSION_MODES, REQUEST_TIMEOUT, SHUTDOWN_GRACE,
     };
     use serde_json::{json, Value};
 
@@ -1342,6 +1481,37 @@ mod tests {
         assert!(version_at_least("dev", "0.1.0"));
         assert!(!version_at_least("0.0.9", "0.1.0"));
         assert!(!version_at_least("garbage", "0.1.0"));
+    }
+
+    #[test]
+    fn session_new_budget_clears_the_engine_ceiling() {
+        // The bug this encodes: session/new used the generic 30s budget, which
+        // is EXACTLY the engine's own MCP-startup cap. Any session whose MCP
+        // startup ran long therefore always lost the race — and the engine
+        // then registered a live session the client had already abandoned.
+        // The client budget must clear that ceiling with room for the
+        // provider/registry/session-persist work layered on top of it.
+        assert!(
+            NEW_SESSION_TIMEOUT >= ENGINE_MCP_STARTUP_CEILING * 2,
+            "session/new must comfortably outlast the engine's {ENGINE_MCP_STARTUP_CEILING:?} \
+             MCP startup cap, got {NEW_SESSION_TIMEOUT:?}"
+        );
+        assert!(NEW_SESSION_TIMEOUT > REQUEST_TIMEOUT);
+        // Still bounded below session/load, which replays a whole transcript.
+        assert!(NEW_SESSION_TIMEOUT < LOAD_TIMEOUT);
+    }
+
+    #[test]
+    fn shutdown_budget_is_bounded() {
+        // A graceful stop runs on the app-exit path, so its worst case is
+        // wall-clock the user waits for the window to go away: stdin close,
+        // then at most one tree kill and one direct kill.
+        let worst_case = SHUTDOWN_GRACE + KILL_GRACE * 2;
+        assert!(
+            worst_case <= super::Duration::from_secs(15),
+            "a wedged engine would delay app exit by {worst_case:?}"
+        );
+        assert!(SHUTDOWN_GRACE > KILL_GRACE, "escalate, do not front-load");
     }
 
     #[test]

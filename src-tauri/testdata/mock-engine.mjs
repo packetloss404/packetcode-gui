@@ -15,9 +15,15 @@
 //                         cancel mid-stream deterministically)
 //   contains "garbage" -> interleaves malformed / unknown lines between
 //                         chunks, then ends end_turn (no permission step)
+//   contains "abandon" -> raises the permission request and then ends the turn
+//                         WITHOUT waiting for an answer, the way a real turn
+//                         aborted by an agent-side context cancel or an
+//                         internal error leaves the client holding a request
+//                         that will never be answered
 //   anything else      -> full happy-path sequence with permission gate
 
 import readline from "node:readline";
+import fs from "node:fs";
 
 const args = process.argv.slice(2);
 
@@ -30,10 +36,23 @@ if (args[0] === "doctor") {
 
 if (args[0] !== "acp") {
   process.stderr.write(
-    "usage: mock-engine.mjs <doctor --json | acp> [--no-usage] [--no-affordances] [--restricted-caps]\n"
+    "usage: mock-engine.mjs <doctor --json | acp> [--no-usage] [--no-affordances] " +
+      "[--restricted-caps] [--shutdown-marker=PATH] [--ignore-stdin-close]\n"
   );
   process.exit(2);
 }
+
+// --shutdown-marker=PATH writes PATH when stdin closes, before exiting. The
+// real engine only releases sessions (Runtime.Close, and the MCP children
+// those sessions spawned) once its stdin scanner returns — see
+// internal/acp/server.go `Serve`/`shutdown`. The marker is how a test tells a
+// graceful stop, which lets that code run, from a kill, which does not.
+const shutdownMarker = (args.find((a) => a.startsWith("--shutdown-marker=")) ?? "")
+  .slice("--shutdown-marker=".length);
+// --ignore-stdin-close simulates an engine wedged in its own shutdown: stdin
+// EOF is observed and then ignored, so the client's graceful stop has to time
+// out and escalate to killing the process.
+const ignoreStdinClose = args.includes("--ignore-stdin-close");
 
 // --no-usage simulates an engine predating the _packetcode/sessions/usage
 // extension: the method answers -32601 and prompt results stay bare.
@@ -222,6 +241,15 @@ async function handlePrompt(id, params) {
   });
 
   if (await step()) return finish("cancelled");
+
+  if (text.includes("abandon")) {
+    // Raise the request, then end the turn without ever answering it. The
+    // client must reap the orphaned waiter when the prompt resolves.
+    requestPermission(sessionId, "call-1");
+    if (await step()) return finish("cancelled");
+    return finish("end_turn");
+  }
+
   const answer = await Promise.race([
     requestPermission(sessionId, "call-1"),
     cancelPromise,
@@ -381,4 +409,19 @@ function handleLine(line) {
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 rl.on("line", handleLine);
-rl.on("close", () => process.exit(0));
+rl.on("close", () => {
+  if (ignoreStdinClose) {
+    // Stay alive (and stay silent) until something kills us. The interval is
+    // only here to keep node's event loop from draining.
+    setInterval(() => {}, 1000);
+    return;
+  }
+  if (shutdownMarker) {
+    try {
+      fs.writeFileSync(shutdownMarker, "shutdown\n");
+    } catch {
+      // A test that cannot observe the marker will fail on its own.
+    }
+  }
+  process.exit(0);
+});

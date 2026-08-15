@@ -5,11 +5,12 @@
 
 use packetcode_gui_lib::engine::{
     cancel_on, capabilities_of, list_commands_on, new_session_on, permission_reply_on,
-    prompt_on, rename_session_on, search_files_on, session_usage_on, start_engine, stop_on,
-    AcpEvents, EngineState, PromptOutcome, SessionUsage, PERMISSION_MODES,
+    prompt_on, rename_session_on, search_files_on, session_usage_on, start_engine, stop_engine,
+    stop_on, AcpEvents, EngineState, PromptOutcome, SessionUsage, PERMISSION_MODES,
 };
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
@@ -64,6 +65,19 @@ async fn start_mock_with(
     .expect("start_engine timed out")
     .expect("start_engine failed");
     (state, rx)
+}
+
+/// A fresh path for a mock-engine shutdown marker. The mock writes it from its
+/// stdin-close handler, so its presence is proof the engine reached its own
+/// shutdown path instead of being killed where it stood.
+fn marker_path(name: &str) -> std::path::PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is sane")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("packetcode-gui-{name}-{unique}.marker"));
+    let _ = std::fs::remove_file(&path);
+    path
 }
 
 /// The usage values baked into the mock engine's scripted responses.
@@ -618,6 +632,169 @@ async fn composer_affordances_are_empty_on_engines_without_the_extensions() {
         .expect("project/files timed out")
         .expect("project/files should not error on -32601");
     assert!(files.is_empty(), "expected no files, got {files:?}");
+
+    stop_on(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn graceful_stop_lets_the_engine_run_its_own_shutdown() {
+    // The bug: stop killed the engine outright, so the engine never reached
+    // `Server.shutdown` (internal/acp/server.go) — the only place it closes
+    // its session runtimes and, with them, the MCP child processes those
+    // sessions spawned. The engine reaches that code when its stdin CLOSES, so
+    // a stop must close stdin and wait, not kill.
+    let marker = marker_path("graceful");
+    let flag = format!("--shutdown-marker={}", marker.display());
+    let (state, _rx) = start_mock_with(&[flag.as_str()]).await;
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+    assert!(session.starts_with("sess-"));
+
+    timeout(STEP, stop_on(&state))
+        .await
+        .expect("graceful stop hung")
+        .expect("stop failed");
+
+    assert!(
+        marker.is_file(),
+        "the engine was killed instead of shut down: no marker at {}",
+        marker.display()
+    );
+    let _ = std::fs::remove_file(&marker);
+
+    // The state is clean afterwards: capabilities are cleared and the bridge
+    // is gone, so a second stop is a harmless no-op.
+    assert!(!capabilities_of(&state).await.packetcode.advertised);
+    timeout(STEP, stop_on(&state))
+        .await
+        .expect("second stop hung")
+        .expect("second stop failed");
+}
+
+#[tokio::test]
+async fn stop_kills_an_engine_that_ignores_stdin_close() {
+    // An engine wedged in its own shutdown must not hold the app hostage: the
+    // grace period expires and the stop escalates to killing the process tree.
+    // A short grace is passed so the test does not sit out the real one.
+    let marker = marker_path("wedged");
+    let flag = format!("--shutdown-marker={}", marker.display());
+    let (state, _rx) = start_mock_with(&["--ignore-stdin-close", flag.as_str()]).await;
+    new_session_on(&state, ".", None, None, None).await.unwrap();
+
+    let grace = Duration::from_millis(300);
+    let started = Instant::now();
+    timeout(STEP, stop_engine(&state, grace))
+        .await
+        .expect("a wedged engine blocked the stop")
+        .expect("stop failed");
+    let elapsed = started.elapsed();
+
+    // It waited for the grace period before escalating...
+    assert!(elapsed >= grace, "stop escalated early, after {elapsed:?}");
+    // ...and this engine never got to finish its shutdown, so it was killed —
+    // which is exactly what the marker's absence certifies.
+    assert!(
+        !marker.is_file(),
+        "the wedged mock claims a clean shutdown at {}",
+        marker.display()
+    );
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[tokio::test]
+async fn abandoned_permission_waiter_is_reaped_when_its_turn_ends() {
+    // A turn that ends by any route other than a reply or a cancel — an
+    // agent-side context cancel, an engine internal error — used to leave its
+    // permission waiter in the map for the life of the process, where a later
+    // cancel would answer a request the engine no longer has pending.
+    // Session A's turn does exactly that; session B's is a live turn whose
+    // request the user is still on their way back to answer, and must survive.
+    let (state, mut rx) = start_mock().await;
+    let a = new_session_on(&state, ".", None, None, None).await.unwrap();
+    let b = new_session_on(&state, ".", None, None, None).await.unwrap();
+    assert_ne!(a, b);
+
+    let turn_a = spawn_prompt(&state, &a, "abandon the request, slow");
+    let turn_b = spawn_prompt(&state, &b, "slow demo");
+
+    let mut perm_a: Option<Value> = None;
+    let mut perm_b: Option<Value> = None;
+    while perm_a.is_none() || perm_b.is_none() {
+        if let Event::Permission(payload) = next_event(&mut rx).await {
+            let session = payload
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if session == a {
+                perm_a = Some(payload);
+            } else if session == b {
+                perm_b = Some(payload);
+            } else {
+                panic!("permission for an unknown session {session}");
+            }
+        }
+    }
+    let id_a = permission_request_id(&perm_a.expect("permission for session a"));
+    let id_b = permission_request_id(&perm_b.expect("permission for session b"));
+
+    // A's turn ends with its request still unanswered.
+    let outcome_a = timeout(STEP, turn_a).await.unwrap().unwrap().unwrap();
+    assert_eq!(outcome_a.stop_reason, "end_turn");
+
+    // The orphaned waiter was reaped with the turn, so a reply now fails
+    // instead of the map growing for good.
+    let err = permission_reply_on(&state, &id_a, "allow_once")
+        .await
+        .expect_err("the abandoned request should have been reaped");
+    assert!(err.contains("no pending permission request"), "got: {err}");
+    // And a cancel of that finished session finds nothing left to answer.
+    timeout(STEP, cancel_on(&state, &a))
+        .await
+        .expect("cancel deadlocked")
+        .expect("cancel failed");
+
+    // Reaping is scoped to the session whose turn ended: B is untouched, still
+    // answerable, and answering carries its turn to completion.
+    timeout(STEP, permission_reply_on(&state, &id_b, "allow_once"))
+        .await
+        .expect("reply to the untouched session deadlocked")
+        .expect("reaping session a dropped session b's waiter");
+    let outcome_b = timeout(STEP, turn_b).await.unwrap().unwrap().unwrap();
+    assert_eq!(outcome_b.stop_reason, "end_turn");
+
+    stop_on(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_with_a_blank_session_id_is_rejected() {
+    // A permission request that named no session used to be recorded under the
+    // session id "", which `cancel_session("")` then matched — answering a
+    // live request that had merely failed to identify itself. Blank ids are
+    // now rejected before anything is sent or swept.
+    let (state, mut rx) = start_mock().await;
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+
+    let turn = spawn_prompt(&state, &session, "slow demo");
+    expect_streamed_prefix(&mut rx, &session).await;
+    let request_id = permission_request_id(&next_permission(&mut rx).await);
+
+    for blank in ["", "   "] {
+        let err = timeout(STEP, cancel_on(&state, blank))
+            .await
+            .expect("blank cancel hung")
+            .expect_err("a blank session id should be rejected");
+        assert!(err.contains("session id"), "got: {err}");
+    }
+
+    // The real request was never swept: it is still pending and still answers.
+    timeout(STEP, permission_reply_on(&state, &request_id, "allow_once"))
+        .await
+        .expect("permission reply deadlocked")
+        .expect("the blank cancel answered a request it did not own");
+    let u = next_update(&mut rx).await;
+    assert_eq!(chunk_text(&u), "Permission granted, continuing.");
+    let outcome = timeout(STEP, turn).await.unwrap().unwrap().unwrap();
+    assert_eq!(outcome.stop_reason, "end_turn");
 
     stop_on(&state).await.unwrap();
 }
