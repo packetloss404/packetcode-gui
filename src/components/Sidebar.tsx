@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { listSessions } from "../acp/client";
+import { listSessions, renameSession } from "../acp/client";
 import type { SessionSummary } from "../acp/types";
-import { pathKey, projectName, samePath } from "../project/projects";
+import { isAbsolutePath, pathKey, projectName, samePath } from "../project/projects";
 
 function relativeTime(iso: string): string {
   const then = Date.parse(iso);
@@ -25,19 +25,31 @@ export function Sidebar(props: {
   activeSessionId: string | null;
   activeProject: string | null;
   recentProjects: string[];
+  /** Bumped by the shell when the persisted list may have changed (turn
+   * completed, session created/renamed); triggers a refetch. */
+  refreshNonce: number;
   onSelectSession: (session: SessionSummary) => void;
   onNewSession: () => void;
   onOpenProject: () => void;
   onSelectProject: (dir: string) => void;
+  /** Tell the shell the list changed (e.g. after an inline rename). */
+  onSessionsChanged: () => void;
 }) {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Inline rename state: the row being edited and its draft text.
+  const [editing, setEditing] = useState<{ id: string; draft: string } | null>(
+    null,
+  );
 
   useEffect(() => {
     let disposed = false;
     listSessions()
       .then((list) => {
-        if (!disposed) setSessions(list);
+        if (!disposed) {
+          setSessions(list);
+          setError(null);
+        }
       })
       .catch((e) => {
         if (!disposed) setError(String(e));
@@ -45,7 +57,23 @@ export function Sidebar(props: {
     return () => {
       disposed = true;
     };
-  }, [props.activeSessionId]);
+  }, [props.activeSessionId, props.refreshNonce]);
+
+  const commitRename = async () => {
+    if (!editing) return;
+    const { id, draft } = editing;
+    setEditing(null);
+    const name = draft.trim();
+    const previous = sessions.find((s) => s.sessionId === id)?.name ?? "";
+    if (!name || name === previous) return;
+    try {
+      await renameSession(id, name);
+    } catch {
+      // Cosmetic failure (engine too old, session gone); the refetch below
+      // shows whatever the engine actually has.
+    }
+    props.onSessionsChanged();
+  };
 
   // Recent (MRU) projects come first, even when they have no sessions yet;
   // remaining session history is grouped by its own workingDir after them.
@@ -91,10 +119,16 @@ export function Sidebar(props: {
           group.dir !== "" &&
           props.activeProject !== null &&
           samePath(group.dir, props.activeProject);
+        // Legacy summaries may carry relative dirs (old sessions created with
+        // cwd "."); those must not become clickable projects — activating one
+        // would poison the MRU with a non-absolute path.
+        const clickable = group.dir !== "" && isAbsolutePath(group.dir);
         return (
           <div key={key}>
-            {group.dir === "" ? (
-              <div className="project-row">other</div>
+            {!clickable ? (
+              <div className="project-row" title={group.dir || undefined}>
+                {group.dir === "" ? "other" : projectName(group.dir)}
+              </div>
             ) : (
               <button
                 className={activeProject ? "project-row active" : "project-row"}
@@ -107,12 +141,49 @@ export function Sidebar(props: {
             )}
             {group.sessions.slice(0, 8).map((s) => {
               const active = s.sessionId === props.activeSessionId;
+              if (editing && editing.id === s.sessionId) {
+                return (
+                  <div
+                    key={s.sessionId}
+                    className={active ? "session-row active" : "session-row"}
+                  >
+                    <span className={active ? "status-dot running" : "status-dot idle"} />
+                    <input
+                      className="session-rename"
+                      aria-label="Rename session"
+                      autoFocus
+                      value={editing.draft}
+                      onChange={(e) =>
+                        setEditing({ id: s.sessionId, draft: e.target.value })
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") void commitRename();
+                        else if (e.key === "Escape") setEditing(null);
+                      }}
+                      onBlur={() => void commitRename()}
+                    />
+                  </div>
+                );
+              }
+              // Renaming the ACTIVE session is disabled: its live runtime
+              // rewrites the whole session file on the next save, which can
+              // both revert the name and clobber concurrent writes.
+              const canRename = !active;
               return (
                 <button
                   key={s.sessionId}
                   className={active ? "session-row active" : "session-row"}
-                  title={`${s.provider} · ${s.model} · ${s.messageCount} messages`}
+                  title={`${s.provider} · ${s.model} · ${s.messageCount} messages${canRename ? " — double-click or F2 to rename" : ""}`}
                   onClick={() => props.onSelectSession(s)}
+                  onDoubleClick={() => {
+                    if (canRename) setEditing({ id: s.sessionId, draft: s.name });
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "F2" && canRename) {
+                      e.preventDefault();
+                      setEditing({ id: s.sessionId, draft: s.name });
+                    }
+                  }}
                 >
                   <span className={active ? "status-dot running" : "status-dot idle"} />
                   <span className="session-name">{s.name || "untitled"}</span>

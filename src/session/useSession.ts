@@ -204,12 +204,17 @@ export function useSession(
   // only apply to the next session this hook creates.
   getModelChoice?: () => ModelOption | null,
   getPermissionMode?: () => PermissionMode | null,
+  // Fired after every completed prompt turn, so the shell can refresh the
+  // session list.
+  onTurnComplete?: () => void,
 ) {
   const [state, dispatch] = useReducer(reduce, initial);
   const sessionRef = useRef<string | null>(null);
   sessionRef.current = state.sessionId;
   const busyRef = useRef(false);
   busyRef.current = state.busy;
+  const onTurnCompleteRef = useRef(onTurnComplete);
+  onTurnCompleteRef.current = onTurnComplete;
 
   useEffect(() => {
     let disposed = false;
@@ -289,6 +294,9 @@ export function useSession(
     };
   }, [cwd, target, getModelChoice, getPermissionMode]);
 
+  // No GUI-side auto-title: the engine already names a fresh session from its
+  // first user prompt when it persists the turn, and a competing rename here
+  // both raced that and forced an extra full session-file rewrite.
   const send = useCallback(async (text: string) => {
     const id = sessionRef.current;
     if (!id) return;
@@ -300,6 +308,7 @@ export function useSession(
       return;
     }
     dispatch({ type: "turn_done" });
+    onTurnCompleteRef.current?.();
   }, []);
 
   const stop = useCallback(() => {

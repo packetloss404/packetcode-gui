@@ -26,6 +26,13 @@ export function samePath(a: string, b: string): boolean {
   return pathKey(a) === pathKey(b);
 }
 
+/** True for drive-lettered, UNC, or POSIX-rooted paths. Legacy session
+ * summaries can carry relative dirs (old sessions created with cwd ".");
+ * those must never become selectable projects or MRU entries. */
+export function isAbsolutePath(path: string): boolean {
+  return /^([a-zA-Z]:[\\/]|\\\\|\/)/.test(path);
+}
+
 function readStringArray(key: string): string[] {
   try {
     const raw = localStorage.getItem(key);

@@ -31,7 +31,14 @@ export default function App() {
   const [phase, setPhase] = useState<Phase>({ name: "probing" });
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [target, setTarget] = useState<SessionTarget>({ kind: "new", nonce: 0 });
-  const onSessionReady = useCallback((id: string) => setActiveSessionId(id), []);
+  // Bumped whenever the persisted session list may have changed (session
+  // created, turn completed, session renamed) so the sidebar refetches live.
+  const [sidebarRefresh, setSidebarRefresh] = useState(0);
+  const bumpSidebar = useCallback(() => setSidebarRefresh((n) => n + 1), []);
+  const onSessionReady = useCallback((id: string) => {
+    setActiveSessionId(id);
+    setSidebarRefresh((n) => n + 1);
+  }, []);
   // Selected project directory (absolute path). New sessions are created in
   // it; loaded sessions prefer their own recorded workingDir. Restored from
   // localStorage so relaunching lands back in the last project.
@@ -184,10 +191,12 @@ export default function App() {
         activeSessionId={activeSessionId}
         activeProject={projectDir}
         recentProjects={recentProjects}
+        refreshNonce={sidebarRefresh}
         onSelectSession={onSelectSession}
         onNewSession={onNewSession}
         onOpenProject={onOpenProject}
         onSelectProject={onSelectProject}
+        onSessionsChanged={bumpSidebar}
       />
       {sessionCwd === null ? (
         <ProjectGate
@@ -201,6 +210,7 @@ export default function App() {
           cwd={sessionCwd}
           target={target}
           onSessionReady={onSessionReady}
+          onTurnComplete={bumpSidebar}
           models={models}
           modelChoice={modelChoice}
           onModelChoice={onModelChoice}

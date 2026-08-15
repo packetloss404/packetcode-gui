@@ -86,6 +86,13 @@ button.project-row:hover { background: var(--color-bg-elevated); }
   font-family: var(--font-mono); font-size: 0.68rem;
   color: var(--color-text-faint); flex: none;
 }
+.session-rename {
+  flex: 1; min-width: 0;
+  font: inherit; color: var(--color-text-primary);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-accent-blue); border-radius: 5px;
+  padding: 1px 5px; outline: none;
+}
 .sidebar-foot {
   margin-top: auto; border-top: 1px solid var(--color-line-soft);
   padding: 10px 8px 2px; display: flex; align-items: center; gap: 8px;
