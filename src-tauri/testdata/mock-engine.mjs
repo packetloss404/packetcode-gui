@@ -29,13 +29,32 @@ if (args[0] === "doctor") {
 }
 
 if (args[0] !== "acp") {
-  process.stderr.write("usage: mock-engine.mjs <doctor --json | acp> [--no-usage]\n");
+  process.stderr.write(
+    "usage: mock-engine.mjs <doctor --json | acp> [--no-usage] [--no-affordances]\n"
+  );
   process.exit(2);
 }
 
 // --no-usage simulates an engine predating the _packetcode/sessions/usage
 // extension: the method answers -32601 and prompt results stay bare.
 const noUsage = args.includes("--no-usage");
+// --no-affordances simulates an engine predating _packetcode/commands/list
+// and _packetcode/project/files: both answer -32601, so the composer's / and
+// @ menus have nothing to offer.
+const noAffordances = args.includes("--no-affordances");
+// Static catalog and file list served by those extensions. The file list is
+// returned unfiltered on purpose — the engine owns ranking, the client just
+// displays what it is handed.
+const slashCommands = [
+  { name: "audit", description: "Security-review the diff", source: "user" },
+  {
+    name: "deploy",
+    description: "Ship to an environment",
+    source: "project",
+    argumentHint: "[arguments]",
+  },
+];
+const projectFiles = ["src/App.tsx", "src/components/Composer.tsx"];
 // Static usage served by the extension and attached to end_turn prompt
 // results, mirroring the real engine's enrichment.
 const sessionUsage = {
@@ -282,6 +301,36 @@ function handleLine(line) {
         break;
       }
       send({ jsonrpc: "2.0", id, result: sessionUsage });
+      break;
+    case "_packetcode/commands/list":
+      if (noAffordances) {
+        send({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32601, message: `Method not found: ${method}` },
+        });
+        break;
+      }
+      send({ jsonrpc: "2.0", id, result: { commands: slashCommands } });
+      break;
+    case "_packetcode/project/files":
+      if (noAffordances) {
+        send({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32601, message: `Method not found: ${method}` },
+        });
+        break;
+      }
+      if (typeof params?.cwd !== "string" || !params.cwd.trim()) {
+        send({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32602, message: "cwd is required" },
+        });
+        break;
+      }
+      send({ jsonrpc: "2.0", id, result: { files: projectFiles } });
       break;
     case "session/cancel":
       // Notification: cancel the in-flight prompt, if any.

@@ -492,6 +492,15 @@ pub async fn start_engine(
     Ok(())
 }
 
+/// Whether a bridge error is the engine answering method-not-found. The
+/// bridge stringifies the whole JSON-RPC error object rather than parsing it,
+/// so this sniffs the serialized text. Every optional `_packetcode/*` vendor
+/// extension routes its "engine predates this feature" case through here and
+/// degrades instead of failing.
+fn is_method_not_found(err: &str) -> bool {
+    err.contains("-32601") || err.contains("Method not found")
+}
+
 /// Clones the bridge handle out of the state so protocol awaits never hold
 /// the state lock (holding it across a prompt is what used to deadlock
 /// cancel and permission replies).
@@ -699,7 +708,7 @@ pub async fn session_usage_on(
         Ok(result) => serde_json::from_value(result)
             .map(Some)
             .map_err(|e| format!("bad usage payload: {e}")),
-        Err(err) if err.contains("-32601") || err.contains("Method not found") => Ok(None),
+        Err(err) if is_method_not_found(&err) => Ok(None),
         Err(err) => Err(err),
     }
 }
@@ -777,7 +786,7 @@ pub async fn engine_list_sessions(
             let sessions = result.get("sessions").cloned().unwrap_or(json!([]));
             serde_json::from_value(sessions).map_err(|e| format!("bad sessions payload: {e}"))
         }
-        Err(err) if err.contains("-32601") || err.contains("Method not found") => {
+        Err(err) if is_method_not_found(&err) => {
             list_sessions_from_disk()
         }
         Err(err) => Err(err),
@@ -802,7 +811,7 @@ pub async fn rename_session_on(
         .await;
     match response {
         Ok(_) => Ok(()),
-        Err(err) if err.contains("-32601") || err.contains("Method not found") => Ok(()),
+        Err(err) if is_method_not_found(&err) => Ok(()),
         Err(err) => Err(err),
     }
 }
@@ -841,9 +850,103 @@ pub async fn engine_list_models(
             let models = result.get("models").cloned().unwrap_or(json!([]));
             serde_json::from_value(models).map_err(|e| format!("bad models payload: {e}"))
         }
-        Err(err) if err.contains("-32601") || err.contains("Method not found") => Ok(Vec::new()),
+        Err(err) if is_method_not_found(&err) => Ok(Vec::new()),
         Err(err) => Err(err),
     }
+}
+
+/// One invocable slash command from the engine's `_packetcode/commands/list`
+/// extension. `source` is "builtin", "user", or "project"; `argumentHint` is a
+/// short usage tail such as "[arguments]" and is absent for commands that take
+/// none. Today's engine reports only markdown commands from
+/// `~/.packetcode/commands` and `<cwd>/.packetcode/commands` — its built-in
+/// slash commands are TUI affordances with no ACP equivalent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+}
+
+/// Slash commands available in `cwd`, via the engine's
+/// `_packetcode/commands/list` ACP extension. Engines that predate the
+/// extension answer method-not-found; that is not an error — the composer's
+/// "/" menu simply has nothing to offer and stops advertising itself.
+pub async fn list_commands_on(
+    state: &EngineState,
+    cwd: &str,
+) -> Result<Vec<SlashCommand>, String> {
+    let response = bridge_of(state)
+        .await?
+        .request(
+            "_packetcode/commands/list",
+            json!({ "cwd": cwd }),
+            REQUEST_TIMEOUT,
+        )
+        .await;
+    match response {
+        Ok(result) => {
+            let commands = result.get("commands").cloned().unwrap_or(json!([]));
+            serde_json::from_value(commands).map_err(|e| format!("bad commands payload: {e}"))
+        }
+        Err(err) if is_method_not_found(&err) => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+#[tauri::command]
+pub async fn engine_list_commands(
+    cwd: String,
+    state: State<'_, EngineState>,
+) -> Result<Vec<SlashCommand>, String> {
+    list_commands_on(&state, &cwd).await
+}
+
+/// How many @-mention candidates one search asks the engine for. The menu
+/// shows a scrollable list, so this is a legibility bound rather than a
+/// protocol one; the engine clamps anything larger itself.
+const FILE_MENTION_LIMIT: u32 = 20;
+
+/// Project files matching `query`, via the engine's
+/// `_packetcode/project/files` ACP extension. Paths are project-relative and
+/// slash-separated, ranked best-match first by the engine. Engines that
+/// predate the extension answer method-not-found; that is not an error — the
+/// composer's "@" menu simply has nothing to offer.
+pub async fn search_files_on(
+    state: &EngineState,
+    cwd: &str,
+    query: &str,
+) -> Result<Vec<String>, String> {
+    let response = bridge_of(state)
+        .await?
+        .request(
+            "_packetcode/project/files",
+            json!({ "cwd": cwd, "query": query, "limit": FILE_MENTION_LIMIT }),
+            REQUEST_TIMEOUT,
+        )
+        .await;
+    match response {
+        Ok(result) => {
+            let files = result.get("files").cloned().unwrap_or(json!([]));
+            serde_json::from_value(files).map_err(|e| format!("bad files payload: {e}"))
+        }
+        Err(err) if is_method_not_found(&err) => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+#[tauri::command]
+pub async fn engine_search_files(
+    cwd: String,
+    query: String,
+    state: State<'_, EngineState>,
+) -> Result<Vec<String>, String> {
+    search_files_on(&state, &cwd, &query).await
 }
 
 fn packetcode_home() -> Option<std::path::PathBuf> {

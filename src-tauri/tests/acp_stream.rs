@@ -4,9 +4,9 @@
 //! instead of a Tauri AppHandle; no packetcode binary is required.
 
 use packetcode_gui_lib::engine::{
-    cancel_on, new_session_on, permission_reply_on, prompt_on, rename_session_on,
-    session_usage_on, start_engine, stop_on, AcpEvents, EngineState, PromptOutcome,
-    SessionUsage,
+    cancel_on, list_commands_on, new_session_on, permission_reply_on, prompt_on,
+    rename_session_on, search_files_on, session_usage_on, start_engine, stop_on, AcpEvents,
+    EngineState, PromptOutcome, SessionUsage,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -429,4 +429,51 @@ async fn engine_death_fails_pending_prompt_promptly() {
         err.contains("engine closed"),
         "unexpected error after engine death: {err}"
     );
+}
+
+#[tokio::test]
+async fn composer_affordances_query_engine_catalogs() {
+    let (state, _rx) = start_mock().await;
+
+    let commands = timeout(STEP, list_commands_on(&state, "/proj/gui"))
+        .await
+        .expect("commands/list timed out")
+        .expect("commands/list should succeed");
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].name, "audit");
+    assert_eq!(commands[0].source, "user");
+    // A command with no $ARGUMENTS placeholder carries no hint.
+    assert_eq!(commands[0].argument_hint, None);
+    assert_eq!(commands[1].name, "deploy");
+    assert_eq!(commands[1].argument_hint.as_deref(), Some("[arguments]"));
+
+    let files = timeout(STEP, search_files_on(&state, "/proj/gui", "compo"))
+        .await
+        .expect("project/files timed out")
+        .expect("project/files should succeed");
+    assert_eq!(files, vec!["src/App.tsx", "src/components/Composer.tsx"]);
+
+    stop_on(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn composer_affordances_are_empty_on_engines_without_the_extensions() {
+    // Method-not-found means "this engine is older", not an error: the / and @
+    // menus must simply have nothing to offer so the composer can drop the
+    // promises from its placeholder.
+    let (state, _rx) = start_mock_with(&["--no-affordances"]).await;
+
+    let commands = timeout(STEP, list_commands_on(&state, "/proj/gui"))
+        .await
+        .expect("commands/list timed out")
+        .expect("commands/list should not error on -32601");
+    assert!(commands.is_empty(), "expected no commands, got {commands:?}");
+
+    let files = timeout(STEP, search_files_on(&state, "/proj/gui", "compo"))
+        .await
+        .expect("project/files timed out")
+        .expect("project/files should not error on -32601");
+    assert!(files.is_empty(), "expected no files, got {files:?}");
+
+    stop_on(&state).await.unwrap();
 }
