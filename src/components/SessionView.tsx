@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from "react";
 import type { ModelOption } from "../acp/types";
+import { projectName } from "../project/projects";
 import { useSession, type SessionTarget } from "../session/useSession";
 import { Composer } from "./Composer";
 import { TimelineItemView } from "./TimelineItemView";
@@ -37,7 +38,9 @@ export function SessionView(props: {
     <section className="content">
       <header className="session-head">
         <h1>Session</h1>
-        <span className="chip">{shownCwd}</span>
+        <span className="chip" title={shownCwd}>
+          {projectName(shownCwd)}
+        </span>
       </header>
       <div className="chat">
         <div className="flow selectable">
@@ -61,6 +64,7 @@ export function SessionView(props: {
         sessionModel={state.model}
         modelChoice={props.modelChoice}
         onModelChoice={props.onModelChoice}
+        projectDir={shownCwd}
       />
     </section>
   );

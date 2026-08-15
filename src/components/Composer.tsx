@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { ModelOption } from "../acp/types";
+import { projectName } from "../project/projects";
 
 const optionKey = (m: ModelOption) => `${m.provider}/${m.model}`;
 
@@ -14,9 +15,14 @@ export function Composer(props: {
   /** Pending choice for the NEXT session; null = engine default. */
   modelChoice: ModelOption | null;
   onModelChoice: (m: ModelOption) => void;
+  /** Directory this session runs in; null when no project is open yet. */
+  projectDir: string | null;
+  /** Blocks input entirely (no project selected). */
+  disabled?: boolean;
 }) {
   const [text, setText] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
+  const disabled = props.disabled ?? false;
 
   useEffect(() => {
     if (!pickerOpen) return;
@@ -29,7 +35,7 @@ export function Composer(props: {
 
   const submit = () => {
     const t = text.trim();
-    if (!t || props.busy) return;
+    if (!t || props.busy || disabled) return;
     setText("");
     props.onSend(t);
   };
@@ -51,13 +57,23 @@ export function Composer(props: {
     <div className="composer-zone">
       <div className="composer">
         <div className="context-strip">
-          <span className="context-chip">packetcode-gui</span>
+          {props.projectDir !== null ? (
+            <span className="context-chip" title={props.projectDir}>
+              {projectName(props.projectDir)}
+            </span>
+          ) : (
+            <span className="context-chip">no project</span>
+          )}
           <span className="context-chip">Local</span>
-          <span className="context-chip mono">main</span>
         </div>
         <div className="input-card">
           <textarea
-            placeholder="Do anything — / for commands, @ for files"
+            placeholder={
+              disabled
+                ? "Open a project to start a session"
+                : "Do anything — / for commands, @ for files"
+            }
+            disabled={disabled}
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => {
@@ -135,7 +151,7 @@ export function Composer(props: {
               <button
                 className="send-btn"
                 onClick={submit}
-                disabled={props.busy || !text.trim()}
+                disabled={props.busy || disabled || !text.trim()}
                 aria-label="Send"
               >
                 ↑

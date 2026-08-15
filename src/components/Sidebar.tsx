@@ -1,12 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { listSessions } from "../acp/client";
 import type { SessionSummary } from "../acp/types";
-
-function projectName(workingDir: string): string {
-  if (!workingDir) return "other";
-  const parts = workingDir.replace(/\\/g, "/").split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? "other";
-}
+import { pathKey, projectName, samePath } from "../project/projects";
 
 function relativeTime(iso: string): string {
   const then = Date.parse(iso);
@@ -19,11 +14,21 @@ function relativeTime(iso: string): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
+interface ProjectGroup {
+  /** Absolute directory, or "" for sessions with no recorded workingDir. */
+  dir: string;
+  sessions: SessionSummary[];
+}
+
 export function Sidebar(props: {
   engineVersion: string;
   activeSessionId: string | null;
+  activeProject: string | null;
+  recentProjects: string[];
   onSelectSession: (session: SessionSummary) => void;
   onNewSession: () => void;
+  onOpenProject: () => void;
+  onSelectProject: (dir: string) => void;
 }) {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -42,16 +47,21 @@ export function Sidebar(props: {
     };
   }, [props.activeSessionId]);
 
-  const projects = useMemo(() => {
-    const groups = new Map<string, SessionSummary[]>();
-    for (const s of sessions) {
-      const key = projectName(s.workingDir);
-      const bucket = groups.get(key);
-      if (bucket) bucket.push(s);
-      else groups.set(key, [s]);
+  // Recent (MRU) projects come first, even when they have no sessions yet;
+  // remaining session history is grouped by its own workingDir after them.
+  const projects = useMemo<ProjectGroup[]>(() => {
+    const groups = new Map<string, ProjectGroup>();
+    for (const dir of props.recentProjects) {
+      groups.set(pathKey(dir), { dir, sessions: [] });
     }
-    return [...groups.entries()];
-  }, [sessions]);
+    for (const s of sessions) {
+      const key = pathKey(s.workingDir);
+      const bucket = groups.get(key);
+      if (bucket) bucket.sessions.push(s);
+      else groups.set(key, { dir: s.workingDir, sessions: [s] });
+    }
+    return [...groups.values()];
+  }, [sessions, props.recentProjects]);
 
   return (
     <aside className="sidebar">
@@ -63,35 +73,56 @@ export function Sidebar(props: {
         <button className="nav-item" onClick={props.onNewSession}>
           + New session
         </button>
+        <button className="nav-item" onClick={props.onOpenProject}>
+          Open project…
+        </button>
         <button className="nav-item">Agents</button>
         <button className="nav-item">Workflows</button>
         <button className="nav-item">Computers</button>
       </nav>
       <div className="section-label">Projects</div>
       {projects.length === 0 && !error ? (
-        <div className="session-row">no sessions yet</div>
+        <div className="session-row">no projects yet</div>
       ) : null}
       {error ? <div className="session-row">history unavailable</div> : null}
-      {projects.map(([name, list]) => (
-        <div key={name}>
-          <div className="project-row">{name}</div>
-          {list.slice(0, 8).map((s) => {
-            const active = s.sessionId === props.activeSessionId;
-            return (
+      {projects.map((group) => {
+        const key = group.dir === "" ? "(none)" : pathKey(group.dir);
+        const activeProject =
+          group.dir !== "" &&
+          props.activeProject !== null &&
+          samePath(group.dir, props.activeProject);
+        return (
+          <div key={key}>
+            {group.dir === "" ? (
+              <div className="project-row">other</div>
+            ) : (
               <button
-                key={s.sessionId}
-                className={active ? "session-row active" : "session-row"}
-                title={`${s.provider} · ${s.model} · ${s.messageCount} messages`}
-                onClick={() => props.onSelectSession(s)}
+                className={activeProject ? "project-row active" : "project-row"}
+                title={group.dir}
+                onClick={() => props.onSelectProject(group.dir)}
               >
-                <span className={active ? "status-dot running" : "status-dot idle"} />
-                <span className="session-name">{s.name || "untitled"}</span>
-                <span className="session-time">{relativeTime(s.updatedAt)}</span>
+                <span className="project-name">{projectName(group.dir)}</span>
+                {activeProject ? <span className="project-mark">●</span> : null}
               </button>
-            );
-          })}
-        </div>
-      ))}
+            )}
+            {group.sessions.slice(0, 8).map((s) => {
+              const active = s.sessionId === props.activeSessionId;
+              return (
+                <button
+                  key={s.sessionId}
+                  className={active ? "session-row active" : "session-row"}
+                  title={`${s.provider} · ${s.model} · ${s.messageCount} messages`}
+                  onClick={() => props.onSelectSession(s)}
+                >
+                  <span className={active ? "status-dot running" : "status-dot idle"} />
+                  <span className="session-name">{s.name || "untitled"}</span>
+                  <span className="session-time">{relativeTime(s.updatedAt)}</span>
+                </button>
+              );
+            })}
+          </div>
+        );
+      })}
       <div className="sidebar-foot">
         <span>packetcode {props.engineVersion}</span>
       </div>
