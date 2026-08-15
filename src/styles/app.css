@@ -72,6 +72,7 @@ button.project-row:hover { background: var(--color-bg-elevated); }
 }
 .project-mark { color: var(--color-accent-green); font-size: 0.55rem; flex: none; }
 .session-row { padding-left: 26px; font-size: 0.86rem; }
+.muted-row { color: var(--color-text-faint); font-size: 0.76rem; }
 .session-row.active { background: var(--color-bg-hover); color: var(--color-text-primary); }
 /* Session dots: blue+pulsing while a turn runs, amber while the session waits
    on a permission answer, grey when it is idle or not live in this app. */
@@ -232,6 +233,49 @@ code {
 }
 .btn.primary { background: var(--color-accent-amber); border-color: var(--color-accent-amber); color: var(--color-bg-primary); }
 .btn:focus-visible { outline: 2px solid var(--color-accent-green); outline-offset: 2px; }
+
+/* An approval this app answered on the user's behalf: red, not amber — it is
+   a refusal that already happened, not a decision waiting for them. */
+.approval.auto { border-color: var(--color-accent-red); }
+.approval.auto .approval-label { color: var(--color-accent-red); }
+.approval-auto { font-size: 0.8rem; color: var(--color-text-secondary); }
+
+/* ── Notices ───────────────────────────────────────────────
+   Auto-decided permission answers. Fixed to the corner so they are visible
+   from any session, and dismissed only by hand — a refusal made on the
+   user's behalf should not scroll away before they have read it. */
+.notices {
+  position: fixed; right: 18px; bottom: 18px; z-index: 20;
+  display: flex; flex-direction: column; gap: 8px;
+  width: min(360px, calc(100vw - 36px));
+}
+.notice {
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-accent-red); border-left-width: 3px;
+  border-radius: 10px; padding: 10px 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.notice-head { display: flex; align-items: center; gap: 8px; }
+.notice-label {
+  flex: 1; min-width: 0;
+  font-size: 0.72rem; font-weight: 700; letter-spacing: 0.07em;
+  text-transform: uppercase; color: var(--color-accent-red);
+}
+.notice-dismiss {
+  flex: none; background: none; border: none; cursor: pointer;
+  color: var(--color-text-muted); font: inherit; font-size: 0.72rem;
+  padding: 0 2px; line-height: 1;
+}
+.notice-dismiss:hover { color: var(--color-text-primary); }
+.notice-target {
+  font-family: var(--font-mono); font-size: 0.8rem;
+  margin: 4px 0 2px; overflow-wrap: anywhere;
+}
+.notice-body { font-size: 0.8rem; color: var(--color-text-secondary); }
+.notice-session {
+  font-family: var(--font-mono); font-size: 0.68rem;
+  color: var(--color-text-faint); margin-top: 4px;
+}
 
 /* ── Composer ──────────────────────────────────────────── */
 .composer-zone { flex: none; padding: 6px 24px 14px; }

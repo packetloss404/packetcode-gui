@@ -15,6 +15,14 @@
 //     resident session must not re-issue session/load: the engine happily
 //     re-loads an idle session, but it replays the whole transcript into the
 //     existing timeline, duplicating history.
+//   * EVERY routing decision is made in here, including the decision to answer
+//     a permission request the user will never see. A caller that read `byId`
+//     itself would be reading a snapshot: an `open` dispatched in the same
+//     commit is not visible until React re-renders, so a legitimate request
+//     arriving in that window would be judged unroutable and rejected. The
+//     reducer sees every dispatch that preceded it, so it cannot make that
+//     mistake — it records the rejection as a pending EFFECT
+//     (`pendingRejects`) that the provider performs and then acknowledges.
 
 import type {
   ModelOption,
@@ -48,7 +56,18 @@ export type TimelineItem =
       status: ToolCallStatus;
       output: string;
     }
-  | { kind: "permission"; id: string; request: PermissionRequest; resolved?: string };
+  | {
+      kind: "permission";
+      id: string;
+      request: PermissionRequest;
+      /** Option id it was answered with, "cancelled" once the turn ended
+       * without an answer, or undefined while it is still open. */
+      resolved?: string;
+      /** True when this app answered on the user's behalf rather than the
+       * user answering it. Rendered differently: a refusal nobody asked for
+       * has to look like one. */
+      auto?: boolean;
+    };
 
 /** Sidebar dot state, derived (never stored — see statusOf). */
 export type SessionStatus = "running" | "attention" | "idle";
@@ -83,10 +102,39 @@ export interface SessionEntry {
   usage: SessionUsage | null;
 }
 
+/** A permission reply the reducer decided on but cannot perform: reducers are
+ * pure, so the engine call is left to the provider, which replies once per
+ * `token` and then dispatches `rejects_flushed`. */
+export interface PendingReject {
+  token: string;
+  requestId: string | number;
+  optionId: string;
+}
+
+/** Something that happened without the user asking, that no timeline could
+ * carry on its own — today, a permission request this app answered (or failed
+ * to answer) for a session it does not hold. Surfaced as a dismissible toast:
+ * a tool call refused on the user's behalf must never be silent. */
+export interface Notice {
+  id: string;
+  /** `auto_rejected`: the engine's own rejection option was sent.
+   *  `unanswerable`: no option could be classified as a rejection, so nothing
+   *  was sent and the engine's turn may still be blocked. */
+  kind: "auto_rejected" | "unanswerable";
+  sessionId: string;
+  /** Title of the tool call the engine wanted permission for. */
+  title: string;
+}
+
 export interface StoreState {
   entries: Record<SessionKey, SessionEntry>;
   /** sessionId -> owning slot key. The fan-out index for ACP events. */
   byId: Record<string, SessionKey>;
+  /** Rejections the reducer decided on, waiting for the provider to send
+   * them. Drained by `rejects_flushed`. */
+  pendingRejects: PendingReject[];
+  /** Undismissed notices, oldest first. */
+  notices: Notice[];
   /** Bumped whenever the engine's persisted session list may have changed (a
    * session was created, a turn completed). The shell watches it to refresh
    * the sidebar — which is why turn completion needs no callback plumbing back
@@ -122,7 +170,12 @@ export type Action =
     }
   | { type: "turn_done"; key: SessionKey }
   | { type: "usage"; key: SessionKey; usage: SessionUsage }
-  | { type: "error"; key: SessionKey; message: string };
+  | { type: "error"; key: SessionKey; message: string }
+  /** session/cancel itself could not be delivered — see the case below for
+   * why that is the one failure allowed to close open approval cards. */
+  | { type: "cancel_failed"; key: SessionKey; message: string }
+  | { type: "rejects_flushed"; tokens: string[] }
+  | { type: "dismiss_notice"; id: string };
 
 let nextId = 0;
 const genId = () => `t${nextId++}`;
@@ -130,6 +183,8 @@ const genId = () => `t${nextId++}`;
 export const initialStore: StoreState = {
   entries: {},
   byId: {},
+  pendingRejects: [],
+  notices: [],
   listRevision: 0,
 };
 
@@ -161,6 +216,36 @@ export function getEntry(
   return entry ?? null;
 }
 
+/** Slot holding `sessionId` even when it is no longer in the routing index.
+ * `open_failed` drops the `byId` entry (nothing may stream into a dead slot)
+ * while keeping the slot itself on screen, so a late permission request for
+ * that session still has a timeline to be reported in. */
+function findBySessionId(state: StoreState, sessionId: string): SessionKey | null {
+  for (const key of Object.keys(state.entries)) {
+    const entry = getEntry(state, key);
+    if (entry !== null && entry.sessionId === sessionId) return key;
+  }
+  return null;
+}
+
+/** Option to answer an unroutable permission request with: the explicit
+ * rejection if the engine offered one, else nothing. Never an "allow": a
+ * request no view will ever show must not be granted on the user's behalf.
+ *
+ * Defensive about shape — a newer engine may omit `kind`, and a throw on this
+ * path would leave the engine blocked forever, the exact failure the
+ * auto-reject exists to prevent. Never guesses positionally either: options
+ * this client cannot classify get no answer at all rather than a coin flip
+ * that might be an ALLOW. */
+function rejectionOption(request: PermissionRequest): string | null {
+  const reject = (request.options ?? []).find(
+    (o) =>
+      (typeof o?.kind === "string" && o.kind.startsWith("reject")) ||
+      (typeof o?.optionId === "string" && o.optionId.startsWith("reject")),
+  );
+  return reject ? reject.optionId : null;
+}
+
 /** Sidebar dot state. A session waiting on the user outranks a running one:
  * amber means "this one cannot progress until you answer", which is the only
  * state that needs the user to go back to it. */
@@ -170,6 +255,16 @@ export function statusOf(entry: SessionEntry): SessionStatus {
   );
   if (waiting) return "attention";
   return entry.busy ? "running" : "idle";
+}
+
+/** Whether the session still owes the engine something: a turn in flight, or
+ * an approval card the engine is blocked on. One rule behind BOTH the composer
+ * (Stop stays reachable, Send stays disabled) and the sidebar dot, so the two
+ * cannot disagree — `busy` alone goes false on a failed prompt while an
+ * unanswered card still blocks the engine's callClient, and hiding Stop there
+ * removes the only affordance that frees it. */
+export function isEngaged(entry: SessionEntry): boolean {
+  return statusOf(entry) !== "idle";
 }
 
 /** Status of every RESIDENT session, keyed by session id. Sessions absent from
@@ -278,21 +373,93 @@ export function reduce(state: StoreState, action: Action): StoreState {
     case "usage":
       return patch(state, action.key, (entry) => ({ ...entry, usage: action.usage }));
     case "error":
+      // Deliberately does NOT settle open approval cards. An error here is a
+      // failed prompt or a failed permission reply — the engine never heard
+      // about it, so its callClient is still waiting on the very card that
+      // would be greyed out. The card stays live (answer it, or Stop the
+      // session) and `isEngaged` keeps Stop on screen to make that possible.
+      return patch(state, action.key, (entry) => ({
+        ...entry,
+        busy: false,
+        error: action.message,
+      }));
+    case "cancel_failed":
+      // session/cancel could not even be delivered (engine gone). Nothing will
+      // ever answer the open cards, so this is the one failure path where
+      // settling them is the truth rather than a guess.
       return patch(state, action.key, (entry) =>
         settle({ ...entry, busy: false, error: action.message }),
       );
+    case "rejects_flushed": {
+      if (action.tokens.length === 0) return state;
+      const sent = new Set(action.tokens);
+      const remaining = state.pendingRejects.filter((r) => !sent.has(r.token));
+      if (remaining.length === state.pendingRejects.length) return state;
+      return { ...state, pendingRejects: remaining };
+    }
+    case "dismiss_notice": {
+      const remaining = state.notices.filter((n) => n.id !== action.id);
+      if (remaining.length === state.notices.length) return state;
+      return { ...state, notices: remaining };
+    }
     case "permission_request": {
       // Routed by session id, not by "the visible view": the request may well
-      // belong to a session the user has switched away from.
-      const key: SessionKey | undefined = state.byId[action.request.sessionId];
-      if (key === undefined) return state;
-      return patch(state, key, (entry) => ({
-        ...entry,
-        timeline: [
-          ...entry.timeline,
-          { kind: "permission", id: genId(), request: action.request },
-        ],
-      }));
+      // belong to a session the user has switched away from. Deciding it here
+      // rather than in the event handler is what makes the routing index
+      // current — see the note at the top of this file.
+      const request = action.request;
+      const key: SessionKey | undefined = state.byId[request.sessionId];
+      if (key !== undefined) {
+        return patch(state, key, (entry) => ({
+          ...entry,
+          timeline: [
+            ...entry.timeline,
+            { kind: "permission", id: genId(), request },
+          ],
+        }));
+      }
+      // No slot owns this session, so no card would ever be shown and the
+      // engine's turn would block forever on callClient. Answer it with the
+      // engine's own rejection — and make that answer visible, because a tool
+      // call refused on the user's behalf is exactly what must not happen
+      // silently: in the timeline of the orphaned slot when there is one, and
+      // as a notice either way (the user is, by definition, looking
+      // elsewhere).
+      const optionId = rejectionOption(request);
+      const notice: Notice = {
+        id: genId(),
+        kind: optionId === null ? "unanswerable" : "auto_rejected",
+        sessionId: request.sessionId,
+        title: request.toolCall.title,
+      };
+      const queued: StoreState =
+        optionId === null
+          ? state
+          : {
+              ...state,
+              pendingRejects: [
+                ...state.pendingRejects,
+                { token: notice.id, requestId: request.requestId, optionId },
+              ],
+            };
+      const orphan = findBySessionId(queued, request.sessionId);
+      const withCard =
+        orphan === null
+          ? queued
+          : patch(queued, orphan, (entry) => ({
+              ...entry,
+              timeline: [
+                ...entry.timeline,
+                {
+                  kind: "permission",
+                  id: genId(),
+                  request,
+                  resolved: optionId ?? "unanswered",
+                  auto: true,
+                },
+              ],
+            }));
+      return { ...withCard, notices: [...withCard.notices, notice] };
     }
     case "permission_resolved":
       return patch(state, action.key, (entry) => ({
@@ -313,11 +480,16 @@ export function reduce(state: StoreState, action: Action): StoreState {
   }
 }
 
-/** Close out approval cards that can no longer be answered. A permission
- * request blocks its turn, so once the turn has ended — normally, cancelled,
- * or because the engine died — any card still open is dead: the bridge already
- * answered it "cancelled", or nothing is listening. Settling them is what
- * keeps a finished session from sitting amber in the sidebar forever. */
+/** Close out approval cards that can no longer be answered, so a finished
+ * session does not sit amber in the sidebar forever.
+ *
+ * Only ever reached from a state where "cancelled" is TRUE rather than merely
+ * convenient: `turn_done` (the engine ended the turn, so it either got its
+ * answer or the bridge answered "cancelled" for it during session/cancel) and
+ * `cancel_failed` (the engine is unreachable, so nothing is listening). Every
+ * other failure leaves the card open — greying it out would claim the request
+ * is dead while the engine is still blocked on it, and would take the Stop
+ * button away with it. */
 function settle(entry: SessionEntry): SessionEntry {
   if (!entry.timeline.some((i) => i.kind === "permission" && i.resolved === undefined)) {
     return entry;

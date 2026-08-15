@@ -20,6 +20,7 @@ import type {
 } from "./acp/types";
 import { Gate } from "./components/Gate";
 import { InstallGate } from "./components/InstallGate";
+import { Notices } from "./components/Notices";
 import { ProjectGate } from "./components/ProjectGate";
 import { SessionView } from "./components/SessionView";
 import { Sidebar } from "./components/Sidebar";
@@ -51,7 +52,7 @@ export default function App() {
 }
 
 function Shell() {
-  const { state: sessions } = useSessions();
+  const { state: sessions, dismissNotice } = useSessions();
   const [phase, setPhase] = useState<Phase>({ name: "probing" });
   // What the engine advertised at initialize. Null only if the capability
   // read itself failed, which every consumer treats as "engine said nothing".
@@ -246,12 +247,17 @@ function Shell() {
         onSelectProject={onSelectProject}
         onSessionsChanged={bumpSidebar}
         canRenameSessions={supports(capabilities, "sessionsRename")}
+        canListSessions={supports(capabilities, "sessionsList")}
       />
       {sessionCwd === null ? (
         <ProjectGate
           recentProjects={recentProjects}
           onOpenProject={onOpenProject}
           onSelectProject={onSelectProject}
+          permissionMode={permissionMode}
+          onPermissionMode={onPermissionMode}
+          allowedPermissionModes={allowedPermissionModes(capabilities)}
+          engineDefaultMode={engineDefaultPermissionMode(capabilities)}
         />
       ) : (
         <SessionView
@@ -268,6 +274,9 @@ function Shell() {
           usageAvailable={supports(capabilities, "sessionsUsage")}
         />
       )}
+      {/* Above both panes: what the app decided by itself belongs wherever the
+          user is looking, not in a session they may never open. */}
+      <Notices notices={sessions.notices} onDismiss={dismissNotice} />
     </div>
   );
 }

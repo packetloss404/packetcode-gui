@@ -1042,13 +1042,31 @@ pub struct SessionSummary {
     pub cost_usd: f64,
 }
 
+/// Whether `_packetcode/sessions/list` is worth asking for.
+///
+/// An engine that advertised the vendor block and said `sessionsList: false`
+/// is taken at its word. The call-time `-32601` fallback below is not enough
+/// on its own: an engine that knows it does not serve the method is free to
+/// answer with any error it likes (invalid request, unsupported, a plain
+/// string), and every one of those reaches the frontend as "history
+/// unavailable" instead of the disk listing that was available all along.
+/// Engines that advertised nothing keep the old behaviour exactly — ask, and
+/// fall back on method-not-found.
+fn should_ask_engine_for_sessions(caps: &PacketcodeCapabilities) -> bool {
+    !caps.advertised || caps.sessions_list
+}
+
 /// Session history for the sidebar. Prefers the engine's
 /// `_packetcode/sessions/list` ACP extension; falls back to reading
-/// `~/.packetcode/sessions/*.json` when the engine predates it.
+/// `~/.packetcode/sessions/*.json` when the engine predates it, or said in the
+/// handshake that it does not serve it.
 #[tauri::command]
 pub async fn engine_list_sessions(
     state: State<'_, EngineState>,
 ) -> Result<Vec<SessionSummary>, String> {
+    if !should_ask_engine_for_sessions(&capabilities_of(&state).await.packetcode) {
+        return list_sessions_from_disk();
+    }
     let listed = match bridge_of(&state).await {
         Ok(bridge) => {
             bridge
@@ -1462,9 +1480,9 @@ pub async fn engine_stop(state: State<'_, EngineState>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        new_session_params, parse_capabilities, version_at_least, PacketcodeCapabilities,
-        ENGINE_MCP_STARTUP_CEILING, KILL_GRACE, LOAD_TIMEOUT, NEW_SESSION_TIMEOUT,
-        PERMISSION_MODES, REQUEST_TIMEOUT, SHUTDOWN_GRACE,
+        new_session_params, parse_capabilities, should_ask_engine_for_sessions,
+        version_at_least, PacketcodeCapabilities, ENGINE_MCP_STARTUP_CEILING, KILL_GRACE,
+        LOAD_TIMEOUT, NEW_SESSION_TIMEOUT, PERMISSION_MODES, REQUEST_TIMEOUT, SHUTDOWN_GRACE,
     };
     use serde_json::{json, Value};
 
@@ -1603,6 +1621,26 @@ mod tests {
         assert_eq!(caps.packetcode.default_permission_mode, None);
         // Identical to the state used before the handshake completes.
         assert_eq!(caps.packetcode, PacketcodeCapabilities::default());
+    }
+
+    #[test]
+    fn sessions_list_is_asked_for_unless_the_engine_disowned_it() {
+        // Advertised absent: never call, so an engine free to answer with any
+        // error it likes cannot cost the sidebar its disk fallback.
+        let mut caps = PacketcodeCapabilities {
+            advertised: true,
+            sessions_list: false,
+            ..PacketcodeCapabilities::default()
+        };
+        assert!(!should_ask_engine_for_sessions(&caps));
+        // Advertised present: ask.
+        caps.sessions_list = true;
+        assert!(should_ask_engine_for_sessions(&caps));
+        // Advertised nothing (older engine, or another agent entirely): ask,
+        // and let the -32601 fallback decide — the flags carry no information.
+        assert!(should_ask_engine_for_sessions(
+            &PacketcodeCapabilities::default()
+        ));
     }
 
     #[test]

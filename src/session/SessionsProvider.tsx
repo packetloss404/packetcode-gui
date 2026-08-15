@@ -12,7 +12,12 @@
 //      permission request stays answerable: it shows amber in the sidebar and
 //      its approval card is right there when the user returns. The only
 //      unanswerable request is one for a session this app does not hold, and
-//      that one is rejected immediately rather than left blocking the engine.
+//      that one is rejected rather than left blocking the engine — but never
+//      silently, and never on this side of the reducer. The reducer decides
+//      (it is the only reader of `byId` that cannot be stale) and records the
+//      reply in `pendingRejects`; the effect below performs it, exactly once
+//      per token, and the notice it also queued tells the user a tool call was
+//      refused for them.
 
 import {
   createContext,
@@ -32,16 +37,12 @@ import {
   replyPermission,
   sessionUsage,
 } from "../acp/client";
-import type {
-  ModelOption,
-  PermissionMode,
-  PermissionRequest,
-  PromptOutcome,
-} from "../acp/types";
+import type { ModelOption, PermissionMode, PromptOutcome } from "../acp/types";
 import { attachRouter, routerReady } from "./router";
 import {
   getEntry,
   initialStore,
+  isEngaged,
   reduce,
   type SessionKey,
   type SessionTarget,
@@ -67,27 +68,11 @@ export interface SessionsApi {
     requestId: string | number,
     optionId: string,
   ) => void;
+  /** Drop a notice the user has acknowledged. */
+  dismissNotice: (id: string) => void;
 }
 
 const SessionsContext = createContext<SessionsApi | null>(null);
-
-/** Option to answer an unroutable permission request with: the explicit
- * rejection if the engine offered one, else the last option (the engine lists
- * rejection last). Never an "allow": an unattributable request must not be
- * granted on the user's behalf. */
-function rejectionOption(request: PermissionRequest): string | null {
-  // Defensive: a newer engine may omit `kind`, and throwing here would run
-  // inside the event listener — leaving the engine blocked forever, the exact
-  // failure this path exists to prevent. Never guess positionally either: an
-  // engine whose options we cannot classify gets no answer from us rather
-  // than a coin-flip that might be an ALLOW.
-  const reject = (request.options ?? []).find(
-    (o) =>
-      (typeof o?.kind === "string" && o.kind.startsWith("reject")) ||
-      (typeof o?.optionId === "string" && o.optionId.startsWith("reject")),
-  );
-  return reject ? reject.optionId : null;
-}
 
 export function SessionsProvider(props: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reduce, initialStore);
@@ -99,6 +84,10 @@ export function SessionsProvider(props: { children: ReactNode }) {
   // StrictMode's double-invoked effects and two views resolving to the same
   // slot in one commit still produce exactly one session/new or session/load.
   const startedRef = useRef<Set<SessionKey>>(new Set());
+  // Auto-rejects already sent, by token. Same reason as startedRef: the flush
+  // effect is double-invoked under StrictMode, and replying twice to one
+  // request id is at best noise on the wire.
+  const rejectedRef = useRef<Set<string>>(new Set());
   // Per-slot monotonic turn counter; guards the usage fallback against a slow
   // response overwriting a newer turn's numbers.
   const turnSeqRef = useRef<Map<SessionKey, number>>(new Map());
@@ -110,19 +99,34 @@ export function SessionsProvider(props: { children: ReactNode }) {
         // — no stale closure over byId.
         update: (n) =>
           dispatch({ type: "acp_update", sessionId: n.sessionId, update: n.update }),
-        permission: (r) => {
-          if (stateRef.current.byId[r.sessionId] !== undefined) {
-            dispatch({ type: "permission_request", request: r });
-            return;
-          }
-          // No slot owns this session, so no UI will ever show the card and the
-          // engine's turn would block forever on callClient. Answer it.
-          const option = rejectionOption(r);
-          if (option !== null) void replyPermission(r.requestId, option).catch(() => {});
-        },
+        // Same here: whether a slot owns this session is the reducer's call,
+        // never a read of `stateRef` — that snapshot can predate an `open`
+        // dispatched in the same commit and would auto-reject a request the
+        // user was about to be shown.
+        permission: (r) => dispatch({ type: "permission_request", request: r }),
       }),
     [],
   );
+
+  // Perform the rejections the reducer decided on. Kept out of the reducer
+  // (which must stay pure) and out of the event handler (which must stay
+  // ignorant of routing): the queue is the hand-off between them.
+  const pendingRejects = state.pendingRejects;
+  useEffect(() => {
+    if (pendingRejects.length === 0) return;
+    for (const reject of pendingRejects) {
+      if (rejectedRef.current.has(reject.token)) continue;
+      rejectedRef.current.add(reject.token);
+      // Best-effort: if the reply itself fails the engine stays blocked, but
+      // the notice the reducer queued alongside it is already on screen, so
+      // the user is not left guessing why a session went quiet.
+      void replyPermission(reject.requestId, reject.optionId).catch(() => {});
+    }
+    dispatch({
+      type: "rejects_flushed",
+      tokens: pendingRejects.map((r) => r.token),
+    });
+  }, [pendingRejects]);
 
   const open = useCallback(
     (
@@ -196,7 +200,12 @@ export function SessionsProvider(props: { children: ReactNode }) {
 
   const send = useCallback((key: SessionKey, text: string) => {
     const entry = getEntry(stateRef.current, key);
-    if (!entry || !entry.ready || entry.sessionId === null || entry.busy) return;
+    // `isEngaged`, not `busy`: a session sitting on an unanswered approval
+    // card owes the engine a reply, and prompting it again would queue a turn
+    // behind a block the user has not cleared.
+    if (!entry || !entry.ready || entry.sessionId === null || isEngaged(entry)) {
+      return;
+    }
     const id = entry.sessionId;
     const seq = (turnSeqRef.current.get(key) ?? 0) + 1;
     turnSeqRef.current.set(key, seq);
@@ -236,7 +245,13 @@ export function SessionsProvider(props: { children: ReactNode }) {
     const entry = getEntry(stateRef.current, key);
     // engine_cancel also answers this session's outstanding permission
     // requests with "cancelled", so an aborted turn strands nothing.
-    if (entry && entry.sessionId !== null) void acpCancel(entry.sessionId);
+    if (!entry || entry.sessionId === null) return;
+    void acpCancel(entry.sessionId).catch((e: unknown) =>
+      // The cancel never reached the engine. Nothing else will ever answer
+      // this session's open cards, so this is the one path allowed to close
+      // them — otherwise the slot sits amber and unusable forever.
+      dispatch({ type: "cancel_failed", key, message: String(e) }),
+    );
   }, []);
 
   const answerPermission = useCallback(
@@ -250,9 +265,14 @@ export function SessionsProvider(props: { children: ReactNode }) {
     [],
   );
 
+  const dismissNotice = useCallback(
+    (id: string) => dispatch({ type: "dismiss_notice", id }),
+    [],
+  );
+
   const api = useMemo<SessionsApi>(
-    () => ({ state, open, send, stop, answerPermission }),
-    [state, open, send, stop, answerPermission],
+    () => ({ state, open, send, stop, answerPermission, dismissNotice }),
+    [state, open, send, stop, answerPermission, dismissNotice],
   );
 
   return (
