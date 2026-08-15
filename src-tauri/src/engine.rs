@@ -51,32 +51,219 @@ struct DoctorReport {
     version: Option<String>,
 }
 
-pub struct EngineState {
-    inner: Arc<Mutex<Option<Engine>>>,
+/// Sink for agent-initiated traffic. The Tauri layer forwards these to the
+/// webview as events; tests collect them directly.
+pub trait AcpEvents: Send + Sync + 'static {
+    /// Params of a `session/update` notification.
+    fn on_update(&self, params: Value);
+    /// Params of a `session/request_permission` request, with `requestId` added.
+    fn on_permission_request(&self, payload: Value);
+}
+
+struct TauriEvents {
+    app: AppHandle,
+}
+
+impl AcpEvents for TauriEvents {
+    fn on_update(&self, params: Value) {
+        let _ = self.app.emit("acp:update", params);
+    }
+    fn on_permission_request(&self, payload: Value) {
+        let _ = self.app.emit("acp:permission_request", payload);
+    }
+}
+
+/// The ACP protocol client: owns the engine's stdin, the reader/dispatch task,
+/// and request/response bookkeeping. Knows nothing about Tauri, so integration
+/// tests can drive it against a mock engine without an AppHandle.
+pub struct AcpBridge {
     next_request_id: AtomicU64,
     /// Pending client->agent requests awaiting a response.
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
-    /// Pending agent->client permission requests awaiting the user's answer.
-    permission_waiters: Arc<Mutex<HashMap<u64, u64>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
+    /// Agent->client permission requests awaiting the user's answer.
+    permission_waiters: Mutex<HashMap<u64, ()>>,
+    stdin: Mutex<ChildStdin>,
+}
+
+impl AcpBridge {
+    /// Wraps an engine's stdio and spawns the reader task.
+    /// Must be called from within a tokio runtime.
+    pub fn start(
+        stdin: ChildStdin,
+        stdout: tokio::process::ChildStdout,
+        sink: Arc<dyn AcpEvents>,
+    ) -> Arc<Self> {
+        let bridge = Arc::new(Self {
+            next_request_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            permission_waiters: Mutex::new(HashMap::new()),
+            stdin: Mutex::new(stdin),
+        });
+        let reader = bridge.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                reader.dispatch(&line, sink.as_ref()).await;
+            }
+            // Engine went away: fail pending requests now instead of letting
+            // callers sit out their full timeout, and drop stale waiters.
+            for (_, tx) in reader.pending.lock().await.drain() {
+                let _ = tx.send(Err("engine closed the connection".into()));
+            }
+            reader.permission_waiters.lock().await.clear();
+        });
+        bridge
+    }
+
+    /// Routes one incoming NDJSON line: a response, a notification, or a
+    /// server->client request. Unparseable or unrecognized lines are ignored.
+    async fn dispatch(&self, line: &str, sink: &dyn AcpEvents) {
+        let msg: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let has_id = msg.get("id").is_some();
+        let method = msg.get("method").and_then(Value::as_str);
+        match (has_id, method) {
+            // Response to one of our requests.
+            (true, None) => {
+                let Some(id) = msg.get("id").and_then(Value::as_u64) else {
+                    return;
+                };
+                if let Some(tx) = self.pending.lock().await.remove(&id) {
+                    let result = match msg.get("error") {
+                        Some(err) => Err(err.to_string()),
+                        None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                    };
+                    let _ = tx.send(result);
+                }
+            }
+            // Notification from the agent.
+            (false, Some("session/update")) => {
+                if let Some(params) = msg.get("params") {
+                    sink.on_update(params.clone());
+                }
+            }
+            // Request from the agent — today only permission prompts.
+            (true, Some("session/request_permission")) => {
+                let Some(rpc_id) = msg.get("id").and_then(Value::as_u64) else {
+                    return;
+                };
+                self.permission_waiters.lock().await.insert(rpc_id, ());
+                if let Some(params) = msg.get("params") {
+                    let mut payload = params.clone();
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("requestId".into(), json!(rpc_id));
+                    }
+                    sink.on_permission_request(payload);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn write_line(&self, frame: &Value) -> Result<(), String> {
+        let mut line = frame.to_string();
+        line.push('\n');
+        self.stdin
+            .lock()
+            .await
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("engine write failed: {e}"))
+    }
+
+    /// Sends a request and awaits its response. The stdin lock is held only
+    /// for the write, never across the await on the response — cancel and
+    /// permission replies must be able to go out while a prompt is in flight.
+    pub async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        wait: Duration,
+    ) -> Result<Value, String> {
+        let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+
+        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        if let Err(e) = self.write_line(&frame).await {
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
+
+        match timeout(wait, rx).await {
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                Err(format!("{method} timed out"))
+            }
+            Ok(Err(_)) => Err(format!("{method}: engine closed the channel")),
+            Ok(Ok(result)) => result,
+        }
+    }
+
+    /// Sends a notification (no response expected).
+    pub async fn notify(&self, method: &str, params: Value) -> Result<(), String> {
+        self.write_line(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+            .await
+    }
+
+    /// Cancels a session turn: sends `session/cancel` and answers any
+    /// outstanding permission requests with a `cancelled` outcome (the ACP
+    /// contract on cancellation). Late `permission_reply` calls for those
+    /// requests then fail cleanly instead of double-answering the agent.
+    pub async fn cancel_session(&self, session_id: &str) -> Result<(), String> {
+        self.notify("session/cancel", json!({ "sessionId": session_id }))
+            .await?;
+        let stale: Vec<u64> = self
+            .permission_waiters
+            .lock()
+            .await
+            .drain()
+            .map(|(k, _)| k)
+            .collect();
+        for id in stale {
+            let _ = self
+                .write_line(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "outcome": { "outcome": "cancelled" } }
+                }))
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Answers a pending agent permission request with the selected option.
+    pub async fn permission_reply(&self, request_id: u64, option_id: &str) -> Result<(), String> {
+        if self
+            .permission_waiters
+            .lock()
+            .await
+            .remove(&request_id)
+            .is_none()
+        {
+            return Err(format!("no pending permission request {request_id}"));
+        }
+        self.write_line(&json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": { "outcome": { "outcome": "selected", "optionId": option_id } }
+        }))
+        .await
+    }
+}
+
+#[derive(Default)]
+pub struct EngineState {
+    inner: Arc<Mutex<Option<Engine>>>,
     /// Binary path the last probe validated; engine_start spawns exactly this.
     resolved_binary: Arc<Mutex<Option<String>>>,
 }
 
 struct Engine {
     child: Child,
-    stdin: ChildStdin,
-}
-
-impl Default for EngineState {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(None)),
-            next_request_id: AtomicU64::new(1),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            permission_waiters: Arc::new(Mutex::new(HashMap::new())),
-            resolved_binary: Arc::new(Mutex::new(None)),
-        }
-    }
+    bridge: Arc<AcpBridge>,
 }
 
 /// Resolution order: explicit override, PATH, then install.ps1's default
@@ -242,11 +429,6 @@ fn probe_result(
 
 #[tauri::command]
 pub async fn engine_start(app: AppHandle, state: State<'_, EngineState>) -> Result<(), String> {
-    let mut guard = state.inner.lock().await;
-    if guard.is_some() {
-        return Ok(());
-    }
-
     // Spawn exactly what the probe validated; fall back to a fresh resolution
     // only if no probe ran (direct dev invocation).
     let bin = state
@@ -255,150 +437,80 @@ pub async fn engine_start(app: AppHandle, state: State<'_, EngineState>) -> Resu
         .await
         .clone()
         .unwrap_or_else(resolve_engine_binary);
-    let mut child = Command::new(bin)
-        .arg("acp")
+    start_engine(&state, &bin, &["acp"], Arc::new(TauriEvents { app })).await
+}
+
+/// Spawns `program args..`, wires up an [`AcpBridge`], and performs the ACP
+/// initialize handshake. Split out of the Tauri command (with explicit
+/// program/args/sink) so integration tests can run the real start path
+/// against a mock engine without an AppHandle.
+pub async fn start_engine(
+    state: &EngineState,
+    program: &str,
+    args: &[&str],
+    sink: Arc<dyn AcpEvents>,
+) -> Result<(), String> {
+    let mut guard = state.inner.lock().await;
+    if guard.is_some() {
+        return Ok(());
+    }
+
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("failed to spawn packetcode acp: {e}"))?;
+        .map_err(|e| format!("failed to spawn {program} {}: {e}", args.join(" ")))?;
 
     let stdin = child.stdin.take().ok_or("no stdin on engine process")?;
     let stdout = child.stdout.take().ok_or("no stdout on engine process")?;
 
-    // Reader task: route responses, notifications, and server->client requests.
-    let pending = state.pending.clone();
-    let waiters = state.permission_waiters.clone();
-    let reader_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let msg: Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let has_id = msg.get("id").is_some();
-            let method = msg.get("method").and_then(Value::as_str);
-            match (has_id, method) {
-                // Response to one of our requests.
-                (true, None) => {
-                    let Some(id) = msg.get("id").and_then(Value::as_u64) else {
-                        continue;
-                    };
-                    if let Some(tx) = pending.lock().await.remove(&id) {
-                        let result = match msg.get("error") {
-                            Some(err) => Err(err.to_string()),
-                            None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
-                        };
-                        let _ = tx.send(result);
-                    }
-                }
-                // Notification from the agent.
-                (false, Some("session/update")) => {
-                    if let Some(params) = msg.get("params") {
-                        let _ = reader_app.emit("acp:update", params);
-                    }
-                }
-                // Request from the agent — today only permission prompts.
-                (true, Some("session/request_permission")) => {
-                    let Some(rpc_id) = msg.get("id").and_then(Value::as_u64) else {
-                        continue;
-                    };
-                    waiters.lock().await.insert(rpc_id, rpc_id);
-                    if let Some(params) = msg.get("params") {
-                        let mut payload = params.clone();
-                        if let Some(obj) = payload.as_object_mut() {
-                            obj.insert("requestId".into(), json!(rpc_id));
-                        }
-                        let _ = reader_app.emit("acp:permission_request", payload);
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
-
-    let mut engine = Engine { child, stdin };
-    engine_initialized(&mut engine, &state).await?;
-    *guard = Some(engine);
+    let bridge = AcpBridge::start(stdin, stdout, sink);
+    bridge
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false } },
+                "clientInfo": { "name": "packetcode-gui", "version": env!("CARGO_PKG_VERSION") }
+            }),
+            REQUEST_TIMEOUT,
+        )
+        .await?;
+    *guard = Some(Engine { child, bridge });
     Ok(())
 }
 
-async fn engine_initialized(engine: &mut Engine, state: &EngineState) -> Result<Value, String> {
-    request_on(
-        engine,
-        state,
-        "initialize",
-        json!({
-            "protocolVersion": 1,
-            "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false } },
-            "clientInfo": { "name": "packetcode-gui", "version": env!("CARGO_PKG_VERSION") }
-        }),
-        REQUEST_TIMEOUT,
-    )
-    .await
-}
-
-async fn request_on(
-    engine: &mut Engine,
-    state: &EngineState,
-    method: &str,
-    params: Value,
-    wait: Duration,
-) -> Result<Value, String> {
-    let id = state.next_request_id.fetch_add(1, Ordering::SeqCst);
-    let (tx, rx) = oneshot::channel();
-    state.pending.lock().await.insert(id, tx);
-
-    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    let mut line = frame.to_string();
-    line.push('\n');
-    engine
-        .stdin
-        .write_all(line.as_bytes())
+/// Clones the bridge handle out of the state so protocol awaits never hold
+/// the state lock (holding it across a prompt is what used to deadlock
+/// cancel and permission replies).
+async fn bridge_of(state: &EngineState) -> Result<Arc<AcpBridge>, String> {
+    state
+        .inner
+        .lock()
         .await
-        .map_err(|e| format!("engine write failed: {e}"))?;
-
-    match timeout(wait, rx).await {
-        Err(_) => {
-            state.pending.lock().await.remove(&id);
-            Err(format!("{method} timed out"))
-        }
-        Ok(Err(_)) => Err(format!("{method}: engine closed the channel")),
-        Ok(Ok(result)) => result,
-    }
+        .as_ref()
+        .map(|e| e.bridge.clone())
+        .ok_or_else(|| "engine not started".to_string())
 }
 
-async fn request(
-    state: &EngineState,
-    method: &str,
-    params: Value,
-    wait: Duration,
-) -> Result<Value, String> {
-    let mut guard = state.inner.lock().await;
-    let engine = guard.as_mut().ok_or("engine not started")?;
-    request_on(engine, state, method, params, wait).await
-}
-
-#[tauri::command]
-pub async fn engine_new_session(
-    cwd: String,
-    state: State<'_, EngineState>,
-) -> Result<String, String> {
-    let abs = std::fs::canonicalize(&cwd)
+pub async fn new_session_on(state: &EngineState, cwd: &str) -> Result<String, String> {
+    let abs = std::fs::canonicalize(cwd)
         .map_err(|e| format!("cwd {cwd}: {e}"))?
         .to_string_lossy()
         .to_string();
     // Windows canonicalize yields \\?\ paths; the engine wants plain absolutes.
     let abs = abs.trim_start_matches(r"\\?\").to_string();
-    let result = request(
-        &state,
-        "session/new",
-        json!({ "cwd": abs, "mcpServers": [] }),
-        REQUEST_TIMEOUT,
-    )
-    .await?;
+    let result = bridge_of(state)
+        .await?
+        .request(
+            "session/new",
+            json!({ "cwd": abs, "mcpServers": [] }),
+            REQUEST_TIMEOUT,
+        )
+        .await?;
     result
         .get("sessionId")
         .and_then(Value::as_str)
@@ -407,21 +519,29 @@ pub async fn engine_new_session(
 }
 
 #[tauri::command]
-pub async fn engine_prompt(
-    session_id: String,
-    text: String,
+pub async fn engine_new_session(
+    cwd: String,
     state: State<'_, EngineState>,
 ) -> Result<String, String> {
-    let result = request(
-        &state,
-        "session/prompt",
-        json!({
-            "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": text }]
-        }),
-        PROMPT_TIMEOUT,
-    )
-    .await?;
+    new_session_on(&state, &cwd).await
+}
+
+pub async fn prompt_on(
+    state: &EngineState,
+    session_id: &str,
+    text: &str,
+) -> Result<String, String> {
+    let result = bridge_of(state)
+        .await?
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": text }]
+            }),
+            PROMPT_TIMEOUT,
+        )
+        .await?;
     Ok(result
         .get("stopReason")
         .and_then(Value::as_str)
@@ -430,21 +550,32 @@ pub async fn engine_prompt(
 }
 
 #[tauri::command]
+pub async fn engine_prompt(
+    session_id: String,
+    text: String,
+    state: State<'_, EngineState>,
+) -> Result<String, String> {
+    prompt_on(&state, &session_id, &text).await
+}
+
+pub async fn cancel_on(state: &EngineState, session_id: &str) -> Result<(), String> {
+    bridge_of(state).await?.cancel_session(session_id).await
+}
+
+#[tauri::command]
 pub async fn engine_cancel(session_id: String, state: State<'_, EngineState>) -> Result<(), String> {
-    let mut guard = state.inner.lock().await;
-    let engine = guard.as_mut().ok_or("engine not started")?;
-    let frame = json!({
-        "jsonrpc": "2.0",
-        "method": "session/cancel",
-        "params": { "sessionId": session_id }
-    });
-    let mut line = frame.to_string();
-    line.push('\n');
-    engine
-        .stdin
-        .write_all(line.as_bytes())
+    cancel_on(&state, &session_id).await
+}
+
+pub async fn permission_reply_on(
+    state: &EngineState,
+    request_id: u64,
+    option_id: &str,
+) -> Result<(), String> {
+    bridge_of(state)
+        .await?
+        .permission_reply(request_id, option_id)
         .await
-        .map_err(|e| format!("engine write failed: {e}"))
 }
 
 #[tauri::command]
@@ -453,29 +584,7 @@ pub async fn engine_permission_reply(
     option_id: String,
     state: State<'_, EngineState>,
 ) -> Result<(), String> {
-    if state
-        .permission_waiters
-        .lock()
-        .await
-        .remove(&request_id)
-        .is_none()
-    {
-        return Err(format!("no pending permission request {request_id}"));
-    }
-    let mut guard = state.inner.lock().await;
-    let engine = guard.as_mut().ok_or("engine not started")?;
-    let frame = json!({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "result": { "outcome": { "outcome": "selected", "optionId": option_id } }
-    });
-    let mut line = frame.to_string();
-    line.push('\n');
-    engine
-        .stdin
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| format!("engine write failed: {e}"))
+    permission_reply_on(&state, request_id, &option_id).await
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -501,7 +610,15 @@ pub struct SessionSummary {
 pub async fn engine_list_sessions(
     state: State<'_, EngineState>,
 ) -> Result<Vec<SessionSummary>, String> {
-    match request(&state, "_packetcode/sessions/list", json!({}), REQUEST_TIMEOUT).await {
+    let listed = match bridge_of(&state).await {
+        Ok(bridge) => {
+            bridge
+                .request("_packetcode/sessions/list", json!({}), REQUEST_TIMEOUT)
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    match listed {
         Ok(result) => {
             let sessions = result.get("sessions").cloned().unwrap_or(json!([]));
             serde_json::from_value(sessions).map_err(|e| format!("bad sessions payload: {e}"))
@@ -698,12 +815,16 @@ async fn stream_install_output(app: AppHandle, pipe: impl tokio::io::AsyncRead +
     }
 }
 
-#[tauri::command]
-pub async fn engine_stop(state: State<'_, EngineState>) -> Result<(), String> {
+pub async fn stop_on(state: &EngineState) -> Result<(), String> {
     if let Some(mut engine) = state.inner.lock().await.take() {
         let _ = engine.child.kill().await;
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn engine_stop(state: State<'_, EngineState>) -> Result<(), String> {
+    stop_on(&state).await
 }
 
 #[cfg(test)]

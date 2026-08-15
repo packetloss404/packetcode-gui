@@ -1,4 +1,4 @@
-mod engine;
+pub mod engine;
 
 use engine::EngineState;
 
