@@ -1,10 +1,18 @@
+import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState } from "react";
 import { listModels, probeEngine, startEngine } from "./acp/client";
 import type { EngineProbe, ModelOption, SessionSummary } from "./acp/types";
 import { Gate } from "./components/Gate";
 import { InstallGate } from "./components/InstallGate";
+import { ProjectGate } from "./components/ProjectGate";
 import { SessionView } from "./components/SessionView";
 import { Sidebar } from "./components/Sidebar";
+import {
+  loadActiveProject,
+  loadRecentProjects,
+  rememberProject,
+  samePath,
+} from "./project/projects";
 import type { SessionTarget } from "./session/useSession";
 
 type Phase =
@@ -19,6 +27,38 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [target, setTarget] = useState<SessionTarget>({ kind: "new", nonce: 0 });
   const onSessionReady = useCallback((id: string) => setActiveSessionId(id), []);
+  // Selected project directory (absolute path). New sessions are created in
+  // it; loaded sessions prefer their own recorded workingDir. Restored from
+  // localStorage so relaunching lands back in the last project.
+  const [projectDir, setProjectDir] = useState<string | null>(loadActiveProject);
+  const [recentProjects, setRecentProjects] = useState<string[]>(loadRecentProjects);
+
+  // Switching (or re-picking) a project starts a fresh target, exactly like
+  // "+ New session": the next session is created in the new directory.
+  const activateProject = useCallback((dir: string) => {
+    setProjectDir(dir);
+    setRecentProjects((recent) => rememberProject(dir, recent));
+    setActiveSessionId(null);
+    setTarget({ kind: "new", nonce: Date.now() });
+  }, []);
+
+  const onOpenProject = useCallback(() => {
+    // Native directory picker via the dialog plugin; resolves null on cancel.
+    void open({ directory: true, multiple: false, title: "Open project" }).then(
+      (dir) => {
+        if (typeof dir === "string" && dir.length > 0) activateProject(dir);
+      },
+    );
+  }, [activateProject]);
+
+  const onSelectProject = useCallback(
+    (dir: string) => {
+      // Re-clicking the active project must not tear down a running session.
+      if (projectDir !== null && samePath(projectDir, dir)) return;
+      activateProject(dir);
+    },
+    [activateProject, projectDir],
+  );
   // Provider/model catalog from the engine, and the user's picker choice.
   // The choice applies to the NEXT session; running sessions keep theirs.
   const [models, setModels] = useState<ModelOption[]>([]);
@@ -115,23 +155,43 @@ export default function App() {
   const viewKey =
     target.kind === "load" ? `load:${target.sessionId}` : `new:${target.nonce}`;
 
+  // A load target brings its own recorded workingDir; anything else runs in
+  // the selected project. No directory at all means there is nothing safe to
+  // create a session in, so the project gate renders instead.
+  const sessionCwd =
+    target.kind === "load" && target.workingDir
+      ? target.workingDir
+      : projectDir;
+
   return (
     <div className="shell">
       <Sidebar
         engineVersion={phase.probe.version ?? ""}
         activeSessionId={activeSessionId}
+        activeProject={projectDir}
+        recentProjects={recentProjects}
         onSelectSession={onSelectSession}
         onNewSession={onNewSession}
+        onOpenProject={onOpenProject}
+        onSelectProject={onSelectProject}
       />
-      <SessionView
-        key={viewKey}
-        cwd={"."}
-        target={target}
-        onSessionReady={onSessionReady}
-        models={models}
-        modelChoice={modelChoice}
-        onModelChoice={onModelChoice}
-      />
+      {sessionCwd === null ? (
+        <ProjectGate
+          recentProjects={recentProjects}
+          onOpenProject={onOpenProject}
+          onSelectProject={onSelectProject}
+        />
+      ) : (
+        <SessionView
+          key={viewKey}
+          cwd={sessionCwd}
+          target={target}
+          onSessionReady={onSessionReady}
+          models={models}
+          modelChoice={modelChoice}
+          onModelChoice={onModelChoice}
+        />
+      )}
     </div>
   );
 }
