@@ -1,24 +1,30 @@
 import { useEffect } from "react";
-import { useSession } from "../session/useSession";
+import { useSession, type SessionTarget } from "../session/useSession";
 import { Composer } from "./Composer";
 import { TimelineItemView } from "./TimelineItemView";
 
 export function SessionView(props: {
   cwd: string;
+  target: SessionTarget;
   onSessionReady: (id: string) => void;
 }) {
-  const { state, send, stop, answerPermission } = useSession(props.cwd);
+  const { state, send, stop, answerPermission } = useSession(props.cwd, props.target);
   const { onSessionReady } = props;
 
   useEffect(() => {
     if (state.sessionId) onSessionReady(state.sessionId);
   }, [state.sessionId, onSessionReady]);
 
+  const shownCwd =
+    props.target.kind === "load" && props.target.workingDir
+      ? props.target.workingDir
+      : props.cwd;
+
   return (
     <section className="content">
       <header className="session-head">
         <h1>Session</h1>
-        <span className="chip">{props.cwd}</span>
+        <span className="chip">{shownCwd}</span>
       </header>
       <div className="chat">
         <div className="flow selectable">

@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import {
   cancel as acpCancel,
+  loadSession,
   newSession,
   onPermissionRequest,
   onSessionUpdate,
@@ -18,10 +19,16 @@ import type {
   ToolKind,
 } from "../acp/types";
 
+/** What this view should attach to: a fresh session, or a persisted one
+ * resumed via ACP session/load (which replays its transcript). */
+export type SessionTarget =
+  | { kind: "new" }
+  | { kind: "load"; sessionId: string; workingDir: string };
+
 export type TimelineItem =
-  | { kind: "user"; id: string; text: string }
-  | { kind: "agent_text"; id: string; text: string }
-  | { kind: "agent_thought"; id: string; text: string }
+  | { kind: "user"; id: string; text: string; messageId?: string }
+  | { kind: "agent_text"; id: string; text: string; messageId?: string }
+  | { kind: "agent_thought"; id: string; text: string; messageId?: string }
   | {
       kind: "tool";
       id: string;
@@ -99,10 +106,14 @@ function reduce(state: SessionState, action: Action): SessionState {
 
 function applyUpdate(state: SessionState, update: SessionUpdate): SessionState {
   switch (update.sessionUpdate) {
+    case "user_message_chunk":
+      // Only emitted during session/load replay; live prompts are echoed
+      // locally by the user_prompt action.
+      return appendText(state, "user", update.content.text, update.messageId);
     case "agent_message_chunk":
-      return appendText(state, "agent_text", update.content.text);
+      return appendText(state, "agent_text", update.content.text, update.messageId);
     case "agent_thought_chunk":
-      return appendText(state, "agent_thought", update.content.text);
+      return appendText(state, "agent_thought", update.content.text, update.messageId);
     case "plan":
       return { ...state, plan: update.entries };
     case "tool_call":
@@ -143,11 +154,14 @@ function applyUpdate(state: SessionState, update: SessionUpdate): SessionState {
 
 function appendText(
   state: SessionState,
-  kind: "agent_text" | "agent_thought",
+  kind: "user" | "agent_text" | "agent_thought",
   text: string,
+  messageId?: string,
 ): SessionState {
   const last = state.timeline[state.timeline.length - 1];
-  if (last && last.kind === kind) {
+  // Merge only chunks of the same message: replayed turns carry distinct
+  // messageIds so two adjacent stored messages stay separate bubbles.
+  if (last && last.kind === kind && last.messageId === messageId) {
     return {
       ...state,
       timeline: [
@@ -158,11 +172,11 @@ function appendText(
   }
   return {
     ...state,
-    timeline: [...state.timeline, { kind, id: genId(), text }],
+    timeline: [...state.timeline, { kind, id: genId(), text, messageId }],
   };
 }
 
-export function useSession(cwd: string) {
+export function useSession(cwd: string, target: SessionTarget) {
   const [state, dispatch] = useReducer(reduce, initial);
   const sessionRef = useRef<string | null>(null);
   sessionRef.current = state.sessionId;
@@ -170,28 +184,42 @@ export function useSession(cwd: string) {
   useEffect(() => {
     let disposed = false;
     const unsubs: Array<() => void> = [];
+    // In load mode the sessionId is known before the request returns, and
+    // replay updates arrive while session/load is still in flight — filter on
+    // the known id so they are not dropped.
+    const knownId = target.kind === "load" ? target.sessionId : null;
+    const matches = (sessionId: string) =>
+      sessionId === (sessionRef.current ?? knownId);
 
     (async () => {
       try {
-        const id = await newSession(cwd);
-        if (disposed) return;
-        dispatch({ type: "session_ready", sessionId: id });
+        // Subscribe before touching the engine: session/load replays history
+        // during the request and events without a listener are lost.
         unsubs.push(
           await onSessionUpdate((n) => {
-            if (n.sessionId === sessionRef.current) {
+            if (!disposed && matches(n.sessionId)) {
               dispatch({ type: "acp_update", update: n.update });
             }
           }),
         );
         unsubs.push(
           await onPermissionRequest((r) => {
-            if (r.sessionId === sessionRef.current) {
+            if (!disposed && matches(r.sessionId)) {
               dispatch({ type: "permission_request", request: r });
             }
           }),
         );
+        if (disposed) return;
+        if (target.kind === "load") {
+          dispatch({ type: "session_ready", sessionId: target.sessionId });
+          await loadSession(target.sessionId, target.workingDir || cwd);
+        } else {
+          const id = await newSession(cwd);
+          if (disposed) return;
+          dispatch({ type: "session_ready", sessionId: id });
+        }
       } catch (e) {
-        dispatch({ type: "error", message: String(e) });
+        if (!disposed) dispatch({ type: "error", message: String(e) });
       }
     })();
 
@@ -199,7 +227,7 @@ export function useSession(cwd: string) {
       disposed = true;
       unsubs.forEach((u) => u());
     };
-  }, [cwd]);
+  }, [cwd, target]);
 
   const send = useCallback(async (text: string) => {
     const id = sessionRef.current;

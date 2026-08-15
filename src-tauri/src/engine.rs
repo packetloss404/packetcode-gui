@@ -376,9 +376,38 @@ async fn request(
     params: Value,
     wait: Duration,
 ) -> Result<Value, String> {
-    let mut guard = state.inner.lock().await;
-    let engine = guard.as_mut().ok_or("engine not started")?;
-    request_on(engine, state, method, params, wait).await
+    let id = state.next_request_id.fetch_add(1, Ordering::SeqCst);
+    let (tx, rx) = oneshot::channel();
+    state.pending.lock().await.insert(id, tx);
+
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    let mut line = frame.to_string();
+    line.push('\n');
+    // Write the frame while holding the engine lock, but drop the lock before
+    // awaiting the response: a long-running session/prompt must not block
+    // session/load (or any other command) behind the state mutex for its
+    // entire turn. The reader task resolves `pending` without this lock.
+    {
+        let mut guard = state.inner.lock().await;
+        let Some(engine) = guard.as_mut() else {
+            state.pending.lock().await.remove(&id);
+            return Err("engine not started".into());
+        };
+        if let Err(e) = engine.stdin.write_all(line.as_bytes()).await {
+            drop(guard);
+            state.pending.lock().await.remove(&id);
+            return Err(format!("engine write failed: {e}"));
+        }
+    }
+
+    match timeout(wait, rx).await {
+        Err(_) => {
+            state.pending.lock().await.remove(&id);
+            Err(format!("{method} timed out"))
+        }
+        Ok(Err(_)) => Err(format!("{method}: engine closed the channel")),
+        Ok(Ok(result)) => result,
+    }
 }
 
 #[tauri::command]
@@ -404,6 +433,32 @@ pub async fn engine_new_session(
         .and_then(Value::as_str)
         .map(String::from)
         .ok_or_else(|| "session/new returned no sessionId".into())
+}
+
+/// Resumes a persisted session via ACP `session/load`. The engine replays the
+/// stored transcript as `session/update` notifications (forwarded to the
+/// webview as `acp:update`) before this request resolves, so callers must
+/// subscribe to updates before invoking it.
+#[tauri::command]
+pub async fn engine_load_session(
+    session_id: String,
+    cwd: String,
+    state: State<'_, EngineState>,
+) -> Result<(), String> {
+    let abs = std::fs::canonicalize(&cwd)
+        .map_err(|e| format!("cwd {cwd}: {e}"))?
+        .to_string_lossy()
+        .to_string();
+    // Windows canonicalize yields \\?\ paths; the engine wants plain absolutes.
+    let abs = abs.trim_start_matches(r"\\?\").to_string();
+    request(
+        &state,
+        "session/load",
+        json!({ "sessionId": session_id, "cwd": abs, "mcpServers": [] }),
+        REQUEST_TIMEOUT,
+    )
+    .await?;
+    Ok(())
 }
 
 #[tauri::command]
