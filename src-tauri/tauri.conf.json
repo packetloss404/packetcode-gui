@@ -25,13 +25,26 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["msi", "nsis"],
+    "publisher": "Ian Walmsley",
+    "category": "DeveloperTool",
+    "shortDescription": "Desktop client for the packetcode coding agent",
+    "longDescription": "Packetcode is a desktop client for the packetcode coding agent. The packetcode engine is installed separately and auto-updates independently; it is never bundled with this application.",
+    "license": "MIT",
+    "copyright": "Copyright (c) 2026 Ian Walmsley",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English"],
+        "displayLanguageSelector": false
+      }
+    }
   }
 }
