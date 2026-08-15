@@ -39,6 +39,15 @@ To bump the release version, update `version` in both
 `src-tauri/tauri.conf.json` and `package.json` (and
 `src-tauri/Cargo.toml` to keep them in sync).
 
+## Install modes
+
+The NSIS setup installs per-user (no elevation). The MSI keeps WiX's
+per-machine default and prompts for elevation; the two do not upgrade or
+remove each other, so ship ONE primary installer per channel (NSIS
+recommended) and treat the MSI as the managed-deployment option. The MSI
+UpgradeCode is pinned in tauri.conf.json (bundle.windows.wix.upgradeCode) —
+never change it after a release ships, or upgrades will install side-by-side.
+
 ## Unsigned binaries and SmartScreen
 
 The installers are **not code-signed**. Windows SmartScreen will show an

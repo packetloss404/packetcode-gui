@@ -7,9 +7,12 @@ Packetcode Desktop does **not** bundle or reimplement the agent. It drives the s
 ## Features
 
 - **Chat with the real engine** — streaming responses, agent thoughts, markdown rendering, tool-call cards with live output
+- **Projects** — open any directory as a project; recent projects and their sessions live in the sidebar
 - **Interactive approvals** — packetcode's permission requests surface as inline cards; allow or reject without leaving the flow
-- **Session history & resume** — sessions grouped by project in the sidebar, resumed over ACP `session/load` with full transcript replay
+- **Per-session permission modes** — read-only through bypass, chosen in the composer, enforced (and capped) by the engine
+- **Session history & resume** — sessions grouped by project, resumed over ACP `session/load` with full transcript replay, live titles, inline rename
 - **Model picker** — per-session provider/model choice served by the engine's model catalog
+- **Usage statusline** — context occupancy, cumulative tokens, and cost under the composer after every turn
 - **Guided install** — if no engine is found (or it's too old), the app offers packetcode's official install script with live output, then verifies the result
 
 ## Install
@@ -65,8 +68,10 @@ Vendor extensions (feature-detected via `agentCapabilities._packetcode` in the `
 | Method | Purpose |
 |---|---|
 | `_packetcode/sessions/list` | Session history for the sidebar (disk fallback exists) |
+| `_packetcode/sessions/rename` | Inline session rename from the sidebar |
+| `_packetcode/sessions/usage` | Token/cost usage for the statusline (newer engines also attach usage to prompt results) |
 | `_packetcode/models/list` | Provider/model catalog for the picker |
-| `session/new` `_packetcode: {provider, model}` | Per-session model override |
+| `session/new` `_packetcode: {provider, model, permissionMode}` | Per-session model and permission-mode overrides (the engine caps requested modes at its configured profile) |
 
 Minimum engine version: `MINIMUM_ENGINE_VERSION` in `src-tauri/src/engine.rs`. packetcode keeps the ACP surface additive; the app must degrade, not crash, when a method is missing.
 
