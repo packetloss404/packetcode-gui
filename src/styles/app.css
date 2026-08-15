@@ -243,6 +243,39 @@ code {
   border: 1px solid var(--color-accent-amber); border-radius: 7px;
   padding: 2.5px 9px; background: none; cursor: pointer;
 }
+.mode-chip.tone-amber { color: var(--color-accent-amber); border-color: var(--color-accent-amber); }
+.mode-chip.tone-blue { color: var(--color-accent-blue); border-color: var(--color-accent-blue); }
+.mode-chip.tone-green { color: var(--color-accent-green); border-color: var(--color-accent-green); }
+.mode-chip.tone-red { color: var(--color-accent-red); border-color: var(--color-accent-red); }
+.mode-caret { color: var(--color-text-faint); font-size: 0.6rem; }
+
+/* ── Permission-mode picker ────────────────────────────── */
+.mode-picker { position: relative; display: flex; align-items: center; }
+.mode-pop { left: 0; right: auto; min-width: 260px; }
+.mode-opt {
+  display: flex; align-items: flex-start; gap: 8px; width: 100%;
+  background: none; border: none; border-radius: 6px;
+  padding: 6px 9px; cursor: pointer; text-align: left;
+  font-size: 0.76rem; color: var(--color-text-secondary);
+}
+.mode-opt:hover { background: var(--color-bg-hover); color: var(--color-text-primary); }
+.mode-opt.selected { color: var(--color-text-primary); font-weight: 650; }
+.mode-dot {
+  flex: none; width: 8px; height: 8px; border-radius: 50%;
+  margin-top: 4px; background: var(--color-text-faint);
+}
+.mode-dot.tone-amber { background: var(--color-accent-amber); }
+.mode-dot.tone-blue { background: var(--color-accent-blue); }
+.mode-dot.tone-green { background: var(--color-accent-green); }
+.mode-dot.tone-red { background: var(--color-accent-red); }
+.mode-opt-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.mode-opt-label { font-weight: 650; }
+.mode-opt.tone-red .mode-opt-label { color: var(--color-accent-red); }
+.mode-opt-desc { font-size: 0.68rem; font-weight: 400; color: var(--color-text-faint); }
+.mode-opt-warning {
+  font-size: 0.68rem; font-weight: 500;
+  color: var(--color-accent-red); margin-top: 2px;
+}
 .composer-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
 .model-label { font-size: 0.8rem; color: var(--color-text-secondary); }
 .model-label b { color: var(--color-text-primary); font-weight: 650; }

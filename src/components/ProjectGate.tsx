@@ -54,6 +54,9 @@ export function ProjectGate(props: {
         modelChoice={null}
         onModelChoice={() => undefined}
         projectDir={null}
+        sessionPermissionMode={null}
+        permissionMode={null}
+        onPermissionMode={() => undefined}
       />
     </section>
   );

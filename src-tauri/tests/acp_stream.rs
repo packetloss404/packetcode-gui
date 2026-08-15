@@ -168,7 +168,7 @@ fn permission_request_id(payload: &Value) -> Value {
 #[tokio::test]
 async fn happy_path_streams_events_in_order() {
     let (state, mut rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None).await.expect("session/new");
+    let session = new_session_on(&state, ".", None, None, None).await.expect("session/new");
     assert!(session.starts_with("sess-"), "unexpected session id {session}");
 
     let turn = spawn_prompt(&state, &session, "run the demo");
@@ -204,7 +204,7 @@ async fn happy_path_streams_events_in_order() {
 #[tokio::test]
 async fn permission_reject_fails_tool_and_ends_turn() {
     let (state, mut rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
 
     let turn = spawn_prompt(&state, &session, "run the demo");
     expect_streamed_prefix(&mut rx, &session).await;
@@ -235,7 +235,7 @@ async fn permission_reject_fails_tool_and_ends_turn() {
 #[tokio::test]
 async fn cancel_mid_prompt_yields_cancelled_and_rejects_late_permission_reply() {
     let (state, mut rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
 
     let turn = spawn_prompt(&state, &session, "slow demo");
     expect_streamed_prefix(&mut rx, &session).await;
@@ -261,7 +261,7 @@ async fn cancel_mid_prompt_yields_cancelled_and_rejects_late_permission_reply() 
     assert!(err.contains("no pending permission request"), "got: {err}");
 
     // The engine and reader are still healthy: a fresh turn runs to end_turn.
-    let session2 = new_session_on(&state, ".", None, None).await.unwrap();
+    let session2 = new_session_on(&state, ".", None, None, None).await.unwrap();
     let turn2 = spawn_prompt(&state, &session2, "run the demo");
     expect_streamed_prefix(&mut rx, &session2).await;
     let perm2 = next_permission(&mut rx).await;
@@ -279,7 +279,7 @@ async fn cancel_mid_prompt_yields_cancelled_and_rejects_late_permission_reply() 
 #[tokio::test]
 async fn cancel_during_streaming_chunks_yields_cancelled() {
     let (state, mut rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
 
     let turn = spawn_prompt(&state, &session, "slow demo");
 
@@ -296,7 +296,7 @@ async fn cancel_during_streaming_chunks_yields_cancelled() {
 
     // Anything already in flight when the cancel landed is fine; the session
     // must still accept new turns afterwards.
-    let session2 = new_session_on(&state, ".", None, None).await.unwrap();
+    let session2 = new_session_on(&state, ".", None, None, None).await.unwrap();
     assert!(session2.starts_with("sess-"));
 
     stop_on(&state).await.unwrap();
@@ -305,7 +305,7 @@ async fn cancel_during_streaming_chunks_yields_cancelled() {
 #[tokio::test]
 async fn malformed_and_interleaved_lines_do_not_wedge_the_reader() {
     let (state, mut rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
 
     // "garbage" makes the mock interleave non-JSON, truncated JSON, a
     // response to an id we never sent, and an unknown notification between
@@ -324,7 +324,7 @@ async fn malformed_and_interleaved_lines_do_not_wedge_the_reader() {
     assert_eq!(stop, "end_turn");
 
     // Reader is still routing traffic after the garbage.
-    let session2 = new_session_on(&state, ".", None, None).await.unwrap();
+    let session2 = new_session_on(&state, ".", None, None, None).await.unwrap();
     assert!(session2.starts_with("sess-"));
 
     stop_on(&state).await.unwrap();
@@ -333,7 +333,7 @@ async fn malformed_and_interleaved_lines_do_not_wedge_the_reader() {
 #[tokio::test]
 async fn engine_death_fails_pending_prompt_promptly() {
     let (state, mut rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
 
     let turn = spawn_prompt(&state, &session, "slow demo");
     let u = next_update(&mut rx).await;

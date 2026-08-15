@@ -6,6 +6,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   EngineProbe,
   ModelOption,
+  PermissionMode,
   PermissionRequest,
   SessionNotification,
   SessionSummary,
@@ -24,11 +25,13 @@ export function newSession(
   cwd: string,
   provider?: string,
   model?: string,
+  permissionMode?: PermissionMode,
 ): Promise<string> {
   return invoke<string>("engine_new_session", {
     cwd,
     provider: provider ?? null,
     model: model ?? null,
+    permissionMode: permissionMode ?? null,
   });
 }
 
