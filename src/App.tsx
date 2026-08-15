@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { probeEngine, startEngine } from "./acp/client";
-import type { EngineProbe, SessionSummary } from "./acp/types";
+import { listModels, probeEngine, startEngine } from "./acp/client";
+import type { EngineProbe, ModelOption, SessionSummary } from "./acp/types";
 import { Gate } from "./components/Gate";
 import { InstallGate } from "./components/InstallGate";
 import { SessionView } from "./components/SessionView";
@@ -17,8 +17,13 @@ type Phase =
 export default function App() {
   const [phase, setPhase] = useState<Phase>({ name: "probing" });
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [target, setTarget] = useState<SessionTarget>({ kind: "new" });
+  const [target, setTarget] = useState<SessionTarget>({ kind: "new", nonce: 0 });
   const onSessionReady = useCallback((id: string) => setActiveSessionId(id), []);
+  // Provider/model catalog from the engine, and the user's picker choice.
+  // The choice applies to the NEXT session; running sessions keep theirs.
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [modelChoice, setModelChoice] = useState<ModelOption | null>(null);
+  const onModelChoice = useCallback((m: ModelOption) => setModelChoice(m), []);
 
   const onSelectSession = useCallback((s: SessionSummary) => {
     setActiveSessionId(s.sessionId);
@@ -34,9 +39,9 @@ export default function App() {
 
   const onNewSession = useCallback(() => {
     setActiveSessionId(null);
-    // Same-object reuse as above: already in "new" mode means keep the
-    // current fresh session rather than silently creating another one.
-    setTarget((prev) => (prev.kind === "new" ? prev : { kind: "new" }));
+    // Every click is a fresh target: a new session is created on remount,
+    // picking up the current model choice.
+    setTarget({ kind: "new", nonce: Date.now() });
   }, []);
 
   const probe = useCallback(async () => {
@@ -49,6 +54,12 @@ export default function App() {
       } else {
         await startEngine();
         setPhase({ name: "ready", probe: result });
+        try {
+          setModels(await listModels());
+        } catch {
+          // Older engines have no catalog; the picker just stays inert.
+          setModels([]);
+        }
       }
     } catch (e) {
       setPhase({ name: "error", message: String(e) });
@@ -101,7 +112,8 @@ export default function App() {
 
   // Remount the session view when the target changes so its timeline resets
   // before a resume replay (or a fresh session) fills it.
-  const viewKey = target.kind === "load" ? `load:${target.sessionId}` : "new";
+  const viewKey =
+    target.kind === "load" ? `load:${target.sessionId}` : `new:${target.nonce}`;
 
   return (
     <div className="shell">
@@ -116,6 +128,9 @@ export default function App() {
         cwd={"."}
         target={target}
         onSessionReady={onSessionReady}
+        models={models}
+        modelChoice={modelChoice}
+        onModelChoice={onModelChoice}
       />
     </div>
   );

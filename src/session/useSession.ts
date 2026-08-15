@@ -12,6 +12,7 @@ import {
   replyPermission,
 } from "../acp/client";
 import type {
+  ModelOption,
   PermissionRequest,
   PlanEntry,
   SessionUpdate,
@@ -20,9 +21,11 @@ import type {
 } from "../acp/types";
 
 /** What this view should attach to: a fresh session, or a persisted one
- * resumed via ACP session/load (which replays its transcript). */
+ * resumed via ACP session/load (which replays its transcript). The nonce
+ * makes each "+ New session" click a distinct target, so a fresh session is
+ * created (with the current model choice) instead of reusing the old one. */
 export type SessionTarget =
-  | { kind: "new" }
+  | { kind: "new"; nonce: number }
   | { kind: "load"; sessionId: string; workingDir: string };
 
 export type TimelineItem =
@@ -42,6 +45,8 @@ export type TimelineItem =
 
 export interface SessionState {
   sessionId: string | null;
+  /** Provider/model this session was created with; null = engine default. */
+  model: ModelOption | null;
   timeline: TimelineItem[];
   plan: PlanEntry[];
   busy: boolean;
@@ -49,11 +54,11 @@ export interface SessionState {
 }
 
 type Action =
-  | { type: "session_ready"; sessionId: string }
+  | { type: "session_ready"; sessionId: string; model: ModelOption | null }
   | { type: "user_prompt"; text: string }
   | { type: "acp_update"; update: SessionUpdate }
   | { type: "permission_request"; request: PermissionRequest }
-  | { type: "permission_resolved"; requestId: number; optionId: string }
+  | { type: "permission_resolved"; requestId: string | number; optionId: string }
   | { type: "turn_done" }
   | { type: "error"; message: string };
 
@@ -62,6 +67,7 @@ const genId = () => `t${nextId++}`;
 
 const initial: SessionState = {
   sessionId: null,
+  model: null,
   timeline: [],
   plan: [],
   busy: false,
@@ -71,7 +77,7 @@ const initial: SessionState = {
 function reduce(state: SessionState, action: Action): SessionState {
   switch (action.type) {
     case "session_ready":
-      return { ...state, sessionId: action.sessionId };
+      return { ...state, sessionId: action.sessionId, model: action.model };
     case "user_prompt":
       return {
         ...state,
@@ -176,10 +182,19 @@ function appendText(
   };
 }
 
-export function useSession(cwd: string, target: SessionTarget) {
+export function useSession(
+  cwd: string,
+  target: SessionTarget,
+  // Read once per session creation. A stable getter (not a value) so that
+  // changing the picker never tears down the running session — the choice
+  // only applies to the next session this hook creates.
+  getModelChoice?: () => ModelOption | null,
+) {
   const [state, dispatch] = useReducer(reduce, initial);
   const sessionRef = useRef<string | null>(null);
   sessionRef.current = state.sessionId;
+  const busyRef = useRef(false);
+  busyRef.current = state.busy;
 
   useEffect(() => {
     let disposed = false;
@@ -211,12 +226,18 @@ export function useSession(cwd: string, target: SessionTarget) {
         );
         if (disposed) return;
         if (target.kind === "load") {
-          dispatch({ type: "session_ready", sessionId: target.sessionId });
+          // session_ready only after the load succeeds: a failed load must
+          // not leave a promptable session pointing at unseen context.
+          // Resumed sessions keep the provider/model they were created with;
+          // the picker's pending choice applies only to fresh sessions.
           await loadSession(target.sessionId, target.workingDir || cwd);
-        } else {
-          const id = await newSession(cwd);
           if (disposed) return;
-          dispatch({ type: "session_ready", sessionId: id });
+          dispatch({ type: "session_ready", sessionId: target.sessionId, model: null });
+        } else {
+          const choice = getModelChoice?.() ?? null;
+          const id = await newSession(cwd, choice?.provider, choice?.model);
+          if (disposed) return;
+          dispatch({ type: "session_ready", sessionId: id, model: choice });
         }
       } catch (e) {
         if (!disposed) dispatch({ type: "error", message: String(e) });
@@ -226,8 +247,15 @@ export function useSession(cwd: string, target: SessionTarget) {
     return () => {
       disposed = true;
       unsubs.forEach((u) => u());
+      // Switching away mid-turn must not strand the old session: an
+      // unanswered permission request blocks the engine's turn forever and
+      // every later session/load of it returns busy. engine_cancel also
+      // answers outstanding permission requests with "cancelled".
+      if (busyRef.current && sessionRef.current) {
+        void acpCancel(sessionRef.current);
+      }
     };
-  }, [cwd, target]);
+  }, [cwd, target, getModelChoice]);
 
   const send = useCallback(async (text: string) => {
     const id = sessionRef.current;
@@ -248,7 +276,7 @@ export function useSession(cwd: string, target: SessionTarget) {
   }, []);
 
   const answerPermission = useCallback(
-    async (requestId: number, optionId: string) => {
+    async (requestId: string | number, optionId: string) => {
       await replyPermission(requestId, optionId);
       dispatch({ type: "permission_resolved", requestId, optionId });
     },

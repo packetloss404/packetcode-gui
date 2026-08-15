@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   EngineProbe,
+  ModelOption,
   PermissionRequest,
   SessionNotification,
   SessionSummary,
@@ -19,8 +20,16 @@ export function startEngine(): Promise<void> {
   return invoke("engine_start");
 }
 
-export function newSession(cwd: string): Promise<string> {
-  return invoke<string>("engine_new_session", { cwd });
+export function newSession(
+  cwd: string,
+  provider?: string,
+  model?: string,
+): Promise<string> {
+  return invoke<string>("engine_new_session", {
+    cwd,
+    provider: provider ?? null,
+    model: model ?? null,
+  });
 }
 
 /** Resume a persisted session. Replay updates are emitted on `acp:update`
@@ -41,6 +50,10 @@ export function listSessions(): Promise<SessionSummary[]> {
   return invoke<SessionSummary[]>("engine_list_sessions");
 }
 
+export function listModels(): Promise<ModelOption[]> {
+  return invoke<ModelOption[]>("engine_list_models");
+}
+
 export function installEngine(): Promise<void> {
   return invoke("engine_install");
 }
@@ -52,7 +65,7 @@ export function onInstallOutput(
 }
 
 export function replyPermission(
-  requestId: number,
+  requestId: string | number,
   optionId: string,
 ): Promise<void> {
   return invoke("engine_permission_reply", { requestId, optionId });

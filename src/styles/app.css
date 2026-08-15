@@ -236,6 +236,43 @@ code {
 .composer-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
 .model-label { font-size: 0.8rem; color: var(--color-text-secondary); }
 .model-label b { color: var(--color-text-primary); font-weight: 650; }
+
+/* ── Model picker ──────────────────────────────────────── */
+.model-picker { position: relative; display: flex; align-items: center; }
+.model-btn {
+  display: flex; align-items: center; gap: 5px;
+  background: none; border: none; padding: 2px 4px; border-radius: 6px;
+  cursor: pointer; color: inherit; font: inherit;
+}
+.model-btn:hover:not(:disabled) { background: var(--color-bg-elevated); }
+.model-btn:disabled { cursor: default; }
+.model-provider { color: var(--color-text-faint); font-size: 0.72rem; }
+.model-caret { color: var(--color-text-faint); font-size: 0.6rem; }
+.model-backdrop { position: fixed; inset: 0; z-index: 40; }
+.model-pop {
+  position: absolute; right: 0; bottom: calc(100% + 8px); z-index: 41;
+  min-width: 230px; max-height: 280px; overflow-y: auto;
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-bg-border);
+  border-radius: 10px; padding: 5px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
+}
+.model-pop-hint {
+  font-size: 0.66rem; color: var(--color-text-faint);
+  padding: 4px 9px 7px; margin-bottom: 4px;
+  border-bottom: 1px solid var(--color-line-soft);
+}
+.model-opt {
+  display: flex; align-items: baseline; gap: 8px; width: 100%;
+  background: none; border: none; border-radius: 6px;
+  padding: 5px 9px; cursor: pointer; text-align: left;
+  font-size: 0.76rem; color: var(--color-text-secondary);
+}
+.model-opt:hover { background: var(--color-bg-hover); color: var(--color-text-primary); }
+.model-opt.selected { color: var(--color-text-primary); font-weight: 650; }
+.model-opt-provider { color: var(--color-text-faint); font-size: 0.68rem; min-width: 62px; flex: none; }
+.model-opt-model { overflow-wrap: anywhere; }
+.model-opt-check { margin-left: auto; padding-left: 8px; color: var(--color-accent-green); }
 .send-btn {
   width: 26px; height: 26px; border-radius: 50%;
   background: var(--color-accent-green); border: none;

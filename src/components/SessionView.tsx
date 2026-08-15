@@ -1,4 +1,5 @@
-import { useEffect } from "react";
+import { useCallback, useEffect, useRef } from "react";
+import type { ModelOption } from "../acp/types";
 import { useSession, type SessionTarget } from "../session/useSession";
 import { Composer } from "./Composer";
 import { TimelineItemView } from "./TimelineItemView";
@@ -7,8 +8,20 @@ export function SessionView(props: {
   cwd: string;
   target: SessionTarget;
   onSessionReady: (id: string) => void;
+  models: ModelOption[];
+  modelChoice: ModelOption | null;
+  onModelChoice: (m: ModelOption) => void;
 }) {
-  const { state, send, stop, answerPermission } = useSession(props.cwd, props.target);
+  // Latest picker choice, readable without retriggering session creation.
+  const choiceRef = useRef<ModelOption | null>(props.modelChoice);
+  choiceRef.current = props.modelChoice;
+  const getModelChoice = useCallback(() => choiceRef.current, []);
+
+  const { state, send, stop, answerPermission } = useSession(
+    props.cwd,
+    props.target,
+    getModelChoice,
+  );
   const { onSessionReady } = props;
 
   useEffect(() => {
@@ -40,7 +53,15 @@ export function SessionView(props: {
           ) : null}
         </div>
       </div>
-      <Composer busy={state.busy} onSend={send} onStop={stop} />
+      <Composer
+        busy={state.busy}
+        onSend={send}
+        onStop={stop}
+        models={props.models}
+        sessionModel={state.model}
+        modelChoice={props.modelChoice}
+        onModelChoice={props.onModelChoice}
+      />
     </section>
   );
 }

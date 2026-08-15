@@ -57,7 +57,9 @@ export interface PermissionOption {
 }
 
 export interface PermissionRequest {
-  requestId: number;
+  /** Raw JSON-RPC id of the agent's request — the real engine uses strings
+   * ("packetcode-permission-1"); mocks may use numbers. Echo it back as-is. */
+  requestId: string | number;
   sessionId: string;
   toolCall: {
     toolCallId: string;
@@ -78,6 +80,15 @@ export interface SessionSummary {
   workingDir: string;
   messageCount: number;
   costUsd: number;
+}
+
+// One selectable provider/model pair from `_packetcode/models/list`.
+// `default` marks the pair the engine uses when session/new carries no
+// override.
+export interface ModelOption {
+  provider: string;
+  model: string;
+  default: boolean;
 }
 
 export interface EngineProbe {

@@ -37,7 +37,11 @@ const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
 const sendRaw = (line) => process.stdout.write(line + "\n");
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
-let nextServerId = 1000; // ids for agent->client requests
+// The real engine uses STRING ids for agent->client requests
+// ("packetcode-permission-N", internal/acp/server.go); match that framing so
+// tests certify what production actually sends.
+let nextServerId = 0;
+const serverRequestId = () => `packetcode-permission-${++nextServerId}`;
 let sessionCounter = 0;
 /** id -> resolve(fn) for agent->client requests awaiting a response */
 const awaitingResponse = new Map();
@@ -53,7 +57,7 @@ function update(sessionId, upd) {
 }
 
 function requestPermission(sessionId, toolCallId) {
-  const id = nextServerId++;
+  const id = serverRequestId();
   return new Promise((resolve) => {
     awaitingResponse.set(id, resolve);
     send({
@@ -63,9 +67,10 @@ function requestPermission(sessionId, toolCallId) {
       params: {
         sessionId,
         toolCall: { toolCallId },
+        // Option ids match the real server: allow_once / reject_once.
         options: [
-          { optionId: "allow", name: "Allow", kind: "allow_once" },
-          { optionId: "reject", name: "Reject", kind: "reject_once" },
+          { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+          { optionId: "reject_once", name: "Reject", kind: "reject_once" },
         ],
       },
     });
@@ -180,7 +185,7 @@ async function handlePrompt(id, params) {
   if (state.cancelled) return finish("cancelled");
 
   const outcome = answer?.outcome;
-  if (outcome?.outcome === "selected" && outcome?.optionId === "allow") {
+  if (outcome?.outcome === "selected" && outcome?.optionId === "allow_once") {
     if (await step()) return finish("cancelled");
     update(sessionId, {
       sessionUpdate: "agent_message_chunk",

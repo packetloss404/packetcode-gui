@@ -3,7 +3,7 @@ import { Markdown } from "./Markdown";
 
 export function TimelineItemView(props: {
   item: TimelineItem;
-  onPermission: (requestId: number, optionId: string) => void;
+  onPermission: (requestId: string | number, optionId: string) => void;
 }) {
   const { item } = props;
 

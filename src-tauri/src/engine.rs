@@ -82,8 +82,11 @@ pub struct AcpBridge {
     next_request_id: AtomicU64,
     /// Pending client->agent requests awaiting a response.
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
-    /// Agent->client permission requests awaiting the user's answer.
-    permission_waiters: Mutex<HashMap<u64, ()>>,
+    /// Agent->client permission requests awaiting the user's answer, keyed by
+    /// the canonical JSON of the request id. The real engine uses STRING ids
+    /// ("packetcode-permission-1"), so the raw id Value is stored and echoed
+    /// back verbatim in the reply frame.
+    permission_waiters: Mutex<HashMap<String, Value>>,
     stdin: Mutex<ChildStdin>,
 }
 
@@ -146,16 +149,20 @@ impl AcpBridge {
                     sink.on_update(params.clone());
                 }
             }
-            // Request from the agent — today only permission prompts.
+            // Request from the agent — today only permission prompts. The id
+            // may be a string or a number; it is stored and echoed verbatim.
             (true, Some("session/request_permission")) => {
-                let Some(rpc_id) = msg.get("id").and_then(Value::as_u64) else {
+                let Some(rpc_id) = msg.get("id").cloned() else {
                     return;
                 };
-                self.permission_waiters.lock().await.insert(rpc_id, ());
+                self.permission_waiters
+                    .lock()
+                    .await
+                    .insert(rpc_id.to_string(), rpc_id.clone());
                 if let Some(params) = msg.get("params") {
                     let mut payload = params.clone();
                     if let Some(obj) = payload.as_object_mut() {
-                        obj.insert("requestId".into(), json!(rpc_id));
+                        obj.insert("requestId".into(), rpc_id);
                     }
                     sink.on_permission_request(payload);
                 }
@@ -217,12 +224,12 @@ impl AcpBridge {
     pub async fn cancel_session(&self, session_id: &str) -> Result<(), String> {
         self.notify("session/cancel", json!({ "sessionId": session_id }))
             .await?;
-        let stale: Vec<u64> = self
+        let stale: Vec<Value> = self
             .permission_waiters
             .lock()
             .await
             .drain()
-            .map(|(k, _)| k)
+            .map(|(_, raw)| raw)
             .collect();
         for id in stale {
             let _ = self
@@ -237,19 +244,19 @@ impl AcpBridge {
     }
 
     /// Answers a pending agent permission request with the selected option.
-    pub async fn permission_reply(&self, request_id: u64, option_id: &str) -> Result<(), String> {
-        if self
+    /// `request_id` is the raw JSON-RPC id from the permission event.
+    pub async fn permission_reply(&self, request_id: &Value, option_id: &str) -> Result<(), String> {
+        let Some(raw) = self
             .permission_waiters
             .lock()
             .await
-            .remove(&request_id)
-            .is_none()
-        {
+            .remove(&request_id.to_string())
+        else {
             return Err(format!("no pending permission request {request_id}"));
-        }
+        };
         self.write_line(&json!({
             "jsonrpc": "2.0",
-            "id": request_id,
+            "id": raw,
             "result": { "outcome": { "outcome": "selected", "optionId": option_id } }
         }))
         .await
@@ -498,20 +505,42 @@ async fn bridge_of(state: &EngineState) -> Result<Arc<AcpBridge>, String> {
         .ok_or_else(|| "engine not started".to_string())
 }
 
-pub async fn new_session_on(state: &EngineState, cwd: &str) -> Result<String, String> {
+pub async fn new_session_on(
+    state: &EngineState,
+    cwd: &str,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Result<String, String> {
     let abs = std::fs::canonicalize(cwd)
         .map_err(|e| format!("cwd {cwd}: {e}"))?
         .to_string_lossy()
         .to_string();
     // Windows canonicalize yields \\?\ paths; the engine wants plain absolutes.
     let abs = abs.trim_start_matches(r"\\?\").to_string();
+    let mut params = json!({ "cwd": abs, "mcpServers": [] });
+    // Optional per-session provider/model override, carried in the engine's
+    // "_packetcode" vendor-extension params object. Omitted entirely when the
+    // caller wants the engine defaults, so older engines see a spec-only call.
+    let provider = provider
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    let model = model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+    if provider.is_some() || model.is_some() {
+        let mut ext = serde_json::Map::new();
+        if let Some(p) = provider {
+            ext.insert("provider".into(), json!(p));
+        }
+        if let Some(m) = model {
+            ext.insert("model".into(), json!(m));
+        }
+        params
+            .as_object_mut()
+            .expect("session/new params are an object")
+            .insert("_packetcode".into(), Value::Object(ext));
+    }
     let result = bridge_of(state)
         .await?
-        .request(
-            "session/new",
-            json!({ "cwd": abs, "mcpServers": [] }),
-            REQUEST_TIMEOUT,
-        )
+        .request("session/new", params, REQUEST_TIMEOUT)
         .await?;
     result
         .get("sessionId")
@@ -558,9 +587,11 @@ pub async fn engine_load_session(
 #[tauri::command]
 pub async fn engine_new_session(
     cwd: String,
+    provider: Option<String>,
+    model: Option<String>,
     state: State<'_, EngineState>,
 ) -> Result<String, String> {
-    new_session_on(&state, &cwd).await
+    new_session_on(&state, &cwd, provider, model).await
 }
 
 pub async fn prompt_on(
@@ -606,7 +637,7 @@ pub async fn engine_cancel(session_id: String, state: State<'_, EngineState>) ->
 
 pub async fn permission_reply_on(
     state: &EngineState,
-    request_id: u64,
+    request_id: &Value,
     option_id: &str,
 ) -> Result<(), String> {
     bridge_of(state)
@@ -617,11 +648,11 @@ pub async fn permission_reply_on(
 
 #[tauri::command]
 pub async fn engine_permission_reply(
-    request_id: u64,
+    request_id: Value,
     option_id: String,
     state: State<'_, EngineState>,
 ) -> Result<(), String> {
-    permission_reply_on(&state, request_id, &option_id).await
+    permission_reply_on(&state, &request_id, &option_id).await
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -663,6 +694,36 @@ pub async fn engine_list_sessions(
         Err(err) if err.contains("-32601") || err.contains("Method not found") => {
             list_sessions_from_disk()
         }
+        Err(err) => Err(err),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOption {
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub default: bool,
+}
+
+/// Provider/model choices via the engine's `_packetcode/models/list` ACP
+/// extension. Engines that predate the extension answer method-not-found;
+/// that is not an error — the picker simply has nothing to offer.
+#[tauri::command]
+pub async fn engine_list_models(
+    state: State<'_, EngineState>,
+) -> Result<Vec<ModelOption>, String> {
+    let response = bridge_of(&state)
+        .await?
+        .request("_packetcode/models/list", json!({}), REQUEST_TIMEOUT)
+        .await;
+    match response {
+        Ok(result) => {
+            let models = result.get("models").cloned().unwrap_or(json!([]));
+            serde_json::from_value(models).map_err(|e| format!("bad models payload: {e}"))
+        }
+        Err(err) if err.contains("-32601") || err.contains("Method not found") => Ok(Vec::new()),
         Err(err) => Err(err),
     }
 }
