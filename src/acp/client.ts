@@ -35,6 +35,16 @@ export function listSessions(): Promise<SessionSummary[]> {
   return invoke<SessionSummary[]>("engine_list_sessions");
 }
 
+export function installEngine(): Promise<void> {
+  return invoke("engine_install");
+}
+
+export function onInstallOutput(
+  handler: (line: string) => void,
+): Promise<UnlistenFn> {
+  return listen<string>("engine:install_output", (e) => handler(e.payload));
+}
+
 export function replyPermission(
   requestId: number,
   optionId: string,

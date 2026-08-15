@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { probeEngine, startEngine } from "./acp/client";
 import type { EngineProbe } from "./acp/types";
+import { Gate } from "./components/Gate";
+import { InstallGate } from "./components/InstallGate";
 import { SessionView } from "./components/SessionView";
 import { Sidebar } from "./components/Sidebar";
 
@@ -16,59 +18,63 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const onSessionReady = useCallback((id: string) => setActiveSessionId(id), []);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const probe = await probeEngine();
-        if (!probe.found) {
-          setPhase({ name: "missing", probe });
-        } else if (!probe.compatible) {
-          setPhase({ name: "incompatible", probe });
-        } else {
-          await startEngine();
-          setPhase({ name: "ready", probe });
-        }
-      } catch (e) {
-        setPhase({ name: "error", message: String(e) });
+  const probe = useCallback(async () => {
+    try {
+      const result = await probeEngine();
+      if (!result.found) {
+        setPhase({ name: "missing", probe: result });
+      } else if (!result.compatible) {
+        setPhase({ name: "incompatible", probe: result });
+      } else {
+        await startEngine();
+        setPhase({ name: "ready", probe: result });
       }
-    })();
+    } catch (e) {
+      setPhase({ name: "error", message: String(e) });
+    }
   }, []);
 
+  useEffect(() => {
+    void probe();
+  }, [probe]);
+
   if (phase.name === "probing") {
-    return (
-      <div className="gate">
-        <div className="inner">
-          <img src="/favicon.png" alt="" />
-          <h2>Packetcode</h2>
-          <p>Checking for the packetcode engine…</p>
-        </div>
-      </div>
-    );
+    return <Gate title="Packetcode" body="Checking for the packetcode engine…" />;
   }
 
   if (phase.name === "missing") {
     return (
-      <Gate
+      <InstallGate
         title="packetcode not found"
-        body="Packetcode Desktop drives the packetcode CLI, but no packetcode binary was found on PATH. Install it, then relaunch."
+        body="Packetcode Desktop drives the packetcode CLI, and no packetcode binary was found on PATH or in the default install location."
+        actionLabel="Install packetcode"
+        installSupported={phase.probe.installSupported}
         detail={phase.probe.detail}
+        onInstalled={probe}
       />
     );
   }
 
   if (phase.name === "incompatible") {
     return (
-      <Gate
+      <InstallGate
         title="packetcode is too old"
-        body={`This app needs packetcode ${phase.probe.minimumVersion} or newer (found ${phase.probe.version ?? "unknown"}). Update packetcode, then relaunch.`}
+        body={`This app needs packetcode ${phase.probe.minimumVersion} or newer (found ${phase.probe.version ?? "unknown"}). The install script upgrades in place.`}
+        actionLabel="Update packetcode"
+        installSupported={phase.probe.installSupported}
         detail={phase.probe.detail}
+        onInstalled={probe}
       />
     );
   }
 
   if (phase.name === "error") {
     return (
-      <Gate title="Engine error" body="The packetcode engine failed to start." detail={phase.message} />
+      <Gate
+        title="Engine error"
+        body="The packetcode engine failed to start."
+        detail={phase.message}
+      />
     );
   }
 
@@ -79,19 +85,6 @@ export default function App() {
         activeSessionId={activeSessionId}
       />
       <SessionView cwd={"."} onSessionReady={onSessionReady} />
-    </div>
-  );
-}
-
-function Gate(props: { title: string; body: string; detail?: string }) {
-  return (
-    <div className="gate">
-      <div className="inner">
-        <img src="/favicon.png" alt="" />
-        <h2>{props.title}</h2>
-        <p>{props.body}</p>
-        {props.detail ? <div className="detail selectable">{props.detail}</div> : null}
-      </div>
     </div>
   );
 }

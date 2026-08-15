@@ -84,5 +84,6 @@ export interface EngineProbe {
   status?: string;
   minimumVersion: string;
   compatible: boolean;
+  installSupported: boolean;
   detail?: string;
 }

@@ -13,6 +13,7 @@ pub fn run() {
             engine::engine_cancel,
             engine::engine_permission_reply,
             engine::engine_list_sessions,
+            engine::engine_install,
             engine::engine_stop,
         ])
         .run(tauri::generate_context!())

@@ -37,6 +37,8 @@ pub struct EngineProbe {
     pub status: Option<String>,
     pub minimum_version: String,
     pub compatible: bool,
+    /// Whether engine_install can run on this platform.
+    pub install_supported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -56,6 +58,8 @@ pub struct EngineState {
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
     /// Pending agent->client permission requests awaiting the user's answer.
     permission_waiters: Arc<Mutex<HashMap<u64, u64>>>,
+    /// Binary path the last probe validated; engine_start spawns exactly this.
+    resolved_binary: Arc<Mutex<Option<String>>>,
 }
 
 struct Engine {
@@ -70,12 +74,67 @@ impl Default for EngineState {
             next_request_id: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_waiters: Arc::new(Mutex::new(HashMap::new())),
+            resolved_binary: Arc::new(Mutex::new(None)),
         }
     }
 }
 
-fn engine_binary() -> String {
-    std::env::var("PACKETCODE_GUI_ENGINE").unwrap_or_else(|_| "packetcode".to_string())
+/// Resolution order: explicit override, PATH, then install.ps1's default
+/// target (`%LOCALAPPDATA%\Programs\PacketCode\bin` — the script warns it does
+/// not modify PATH and expects clients to check that documented location).
+/// Returns an absolute path whenever one was verified, so the binary the probe
+/// validated is byte-identical to the one later spawned (a bare name would let
+/// CreateProcess prefer the application directory over PATH).
+fn resolve_engine_binary() -> String {
+    if let Ok(exe) = std::env::var("PACKETCODE_GUI_ENGINE") {
+        let exe = exe.trim();
+        if !exe.is_empty() {
+            return exe.to_string();
+        }
+    }
+    if let Some(hit) = path_search("packetcode") {
+        return hit.to_string_lossy().to_string();
+    }
+    if let Some(default) = default_install_binary() {
+        return default.to_string_lossy().to_string();
+    }
+    "packetcode".to_string()
+}
+
+fn path_search(name: &str) -> Option<std::path::PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    // On Windows, honor PATHEXT so .cmd/.bat shims resolve, and skip
+    // extensionless files (not executable there anyway).
+    let candidates: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .map(|e| e.trim().to_lowercase())
+            .filter(|e| e.starts_with('.'))
+            .map(|e| format!("{name}{e}"))
+            .collect()
+    } else {
+        vec![name.to_string()]
+    };
+    for dir in std::env::split_paths(&paths) {
+        for candidate in &candidates {
+            let full = dir.join(candidate);
+            if full.is_file() {
+                return Some(full);
+            }
+        }
+    }
+    None
+}
+
+fn default_install_binary() -> Option<std::path::PathBuf> {
+    let local = std::env::var("LOCALAPPDATA").ok()?;
+    let full = std::path::PathBuf::from(local)
+        .join("Programs")
+        .join("PacketCode")
+        .join("bin")
+        .join("packetcode.exe");
+    full.is_file().then_some(full)
 }
 
 fn version_at_least(found: &str, minimum: &str) -> bool {
@@ -107,8 +166,13 @@ fn version_at_least(found: &str, minimum: &str) -> bool {
 }
 
 #[tauri::command]
-pub async fn engine_probe() -> Result<EngineProbe, String> {
-    let bin = engine_binary();
+pub async fn engine_probe(state: State<'_, EngineState>) -> Result<EngineProbe, String> {
+    run_probe(&state).await
+}
+
+async fn run_probe(state: &EngineState) -> Result<EngineProbe, String> {
+    let bin = resolve_engine_binary();
+    *state.resolved_binary.lock().await = Some(bin.clone());
     let output = timeout(
         PROBE_TIMEOUT,
         Command::new(&bin)
@@ -122,26 +186,18 @@ pub async fn engine_probe() -> Result<EngineProbe, String> {
 
     let output = match output {
         Err(_) => {
-            return Ok(EngineProbe {
-                found: true,
-                path: Some(bin),
-                version: None,
-                status: None,
-                minimum_version: MINIMUM_ENGINE_VERSION.into(),
-                compatible: false,
-                detail: Some("doctor --json timed out".into()),
-            })
+            return Ok(probe_result(
+                true,
+                Some(bin),
+                None,
+                None,
+                false,
+                Some("doctor --json timed out".into()),
+            ))
         }
         Ok(Err(e)) => {
-            return Ok(EngineProbe {
-                found: false,
-                path: None,
-                version: None,
-                status: None,
-                minimum_version: MINIMUM_ENGINE_VERSION.into(),
-                compatible: false,
-                detail: Some(format!("could not run {bin}: {e}")),
-            })
+            let detail = format!("could not run {bin}: {e}");
+            return Ok(probe_result(false, None, None, None, false, Some(detail)));
         }
         Ok(Ok(o)) => o,
     };
@@ -154,15 +210,34 @@ pub async fn engine_probe() -> Result<EngineProbe, String> {
         .map(|v| version_at_least(v, MINIMUM_ENGINE_VERSION))
         .unwrap_or(false);
 
-    Ok(EngineProbe {
-        found: true,
-        path: Some(bin),
+    Ok(probe_result(
+        true,
+        Some(bin),
         version,
-        status: report.status,
+        report.status,
+        compatible,
+        None,
+    ))
+}
+
+fn probe_result(
+    found: bool,
+    path: Option<String>,
+    version: Option<String>,
+    status: Option<String>,
+    compatible: bool,
+    detail: Option<String>,
+) -> EngineProbe {
+    EngineProbe {
+        found,
+        path,
+        version,
+        status,
         minimum_version: MINIMUM_ENGINE_VERSION.into(),
         compatible,
-        detail: None,
-    })
+        install_supported: cfg!(windows),
+        detail,
+    }
 }
 
 #[tauri::command]
@@ -172,7 +247,15 @@ pub async fn engine_start(app: AppHandle, state: State<'_, EngineState>) -> Resu
         return Ok(());
     }
 
-    let mut child = Command::new(engine_binary())
+    // Spawn exactly what the probe validated; fall back to a fresh resolution
+    // only if no probe ran (direct dev invocation).
+    let bin = state
+        .resolved_binary
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(resolve_engine_binary);
+    let mut child = Command::new(bin)
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -500,6 +583,119 @@ fn list_sessions_from_disk() -> Result<Vec<SessionSummary>, String> {
     // Newest first, same as the engine's ordering.
     out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(out)
+}
+
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const INSTALL_URL: &str =
+    "https://raw.githubusercontent.com/packetloss404/packetcode/main/install.ps1";
+
+/// Runs the official packetcode install script (the documented one-liner from
+/// the README), streaming its output to the webview as `engine:install_output`
+/// events. Success means the engine actually resolves and passes the version
+/// gate afterwards, not merely that PowerShell exited 0.
+#[tauri::command]
+pub async fn engine_install(app: AppHandle, state: State<'_, EngineState>) -> Result<(), String> {
+    if !cfg!(windows) {
+        return Err(
+            "Automatic install is only available on Windows. Install packetcode with the \
+             install.sh script and make sure it is on PATH, then relaunch."
+                .to_string(),
+        );
+    }
+
+    let url = std::env::var("PACKETCODE_GUI_INSTALL_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| INSTALL_URL.to_string());
+    // Stop turns the script's non-terminating errors into a nonzero exit
+    // instead of red text with exit code 0.
+    let command = format!(
+        "$ErrorActionPreference='Stop'; & ([scriptblock]::Create((Invoke-WebRequest {url} -UseBasicParsing).Content))"
+    );
+    let mut child = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("failed to launch installer: {e}"))?;
+
+    let stdout = child.stdout.take().ok_or("no stdout on installer")?;
+    let stderr = child.stderr.take().ok_or("no stderr on installer")?;
+    let readers = [
+        tauri::async_runtime::spawn(stream_install_output(app.clone(), stdout)),
+        tauri::async_runtime::spawn(stream_install_output(app, stderr)),
+    ];
+
+    let status = match timeout(INSTALL_TIMEOUT, child.wait()).await {
+        Err(_) => {
+            kill_process_tree(&child).await;
+            return Err("installer timed out".to_string());
+        }
+        Ok(result) => result.map_err(|e| format!("installer failed to run: {e}"))?,
+    };
+    // Drain the pipes so the log tail (install location, error text) is
+    // delivered before we report a result. Readers end at pipe EOF.
+    for reader in readers {
+        let _ = timeout(Duration::from_secs(5), reader).await;
+    }
+    if !status.success() {
+        return Err(format!("installer exited with {status}"));
+    }
+
+    // The real post-condition: the engine resolves and passes the gate.
+    let probe = run_probe(&state).await?;
+    if !probe.found {
+        return Err(
+            "The installer finished, but packetcode still was not found. It may have \
+             installed to a custom location — set PACKETCODE_GUI_ENGINE to its full path."
+                .to_string(),
+        );
+    }
+    if !probe.compatible {
+        return Err(format!(
+            "The installer finished, but the installed packetcode ({}) is older than the \
+             required {}.",
+            probe.version.as_deref().unwrap_or("unknown"),
+            probe.minimum_version
+        ));
+    }
+    Ok(())
+}
+
+/// Best-effort kill of the installer and everything it spawned. kill_on_drop
+/// only terminates powershell itself; Windows needs an explicit tree kill.
+async fn kill_process_tree(child: &Child) {
+    if !cfg!(windows) {
+        return;
+    }
+    if let Some(pid) = child.id() {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+}
+
+async fn stream_install_output(app: AppHandle, pipe: impl tokio::io::AsyncRead + Unpin) {
+    // Read raw bytes and convert lossily: PowerShell 5.1 emits OEM-codepage
+    // output, and one invalid UTF-8 byte must not truncate the log.
+    let mut reader = BufReader::new(pipe);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&buf).trim_end().to_string();
+                let _ = app.emit("engine:install_output", line);
+            }
+        }
+    }
 }
 
 #[tauri::command]

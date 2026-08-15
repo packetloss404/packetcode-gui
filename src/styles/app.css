@@ -257,3 +257,9 @@ code {
 .gate h2 { margin: 0 0 8px; font-size: 1.1rem; }
 .gate p { color: var(--color-text-muted); margin: 0 0 16px; }
 .gate .detail { font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-text-faint); }
+/* Composes .tool-output; only the gate-specific differences live here. */
+.install-log {
+  margin: 16px 0 0; max-height: 220px; overflow-y: auto; text-align: left;
+  border: 1px solid var(--color-bg-border); border-radius: 8px;
+  white-space: pre-wrap; word-break: break-word;
+}
