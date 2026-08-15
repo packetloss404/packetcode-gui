@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
-import type { ModelOption } from "../acp/types";
+import type { ModelOption, PermissionMode } from "../acp/types";
 import { useSession, type SessionTarget } from "../session/useSession";
 import { Composer } from "./Composer";
 import { TimelineItemView } from "./TimelineItemView";
@@ -11,16 +11,22 @@ export function SessionView(props: {
   models: ModelOption[];
   modelChoice: ModelOption | null;
   onModelChoice: (m: ModelOption) => void;
+  permissionMode: PermissionMode | null;
+  onPermissionMode: (m: PermissionMode) => void;
 }) {
-  // Latest picker choice, readable without retriggering session creation.
+  // Latest picker choices, readable without retriggering session creation.
   const choiceRef = useRef<ModelOption | null>(props.modelChoice);
   choiceRef.current = props.modelChoice;
   const getModelChoice = useCallback(() => choiceRef.current, []);
+  const modeRef = useRef<PermissionMode | null>(props.permissionMode);
+  modeRef.current = props.permissionMode;
+  const getPermissionMode = useCallback(() => modeRef.current, []);
 
   const { state, send, stop, answerPermission } = useSession(
     props.cwd,
     props.target,
     getModelChoice,
+    getPermissionMode,
   );
   const { onSessionReady } = props;
 
@@ -61,6 +67,9 @@ export function SessionView(props: {
         sessionModel={state.model}
         modelChoice={props.modelChoice}
         onModelChoice={props.onModelChoice}
+        sessionPermissionMode={state.permissionMode}
+        permissionMode={props.permissionMode}
+        onPermissionMode={props.onPermissionMode}
       />
     </section>
   );

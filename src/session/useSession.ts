@@ -13,6 +13,7 @@ import {
 } from "../acp/client";
 import type {
   ModelOption,
+  PermissionMode,
   PermissionRequest,
   PlanEntry,
   SessionUpdate,
@@ -47,6 +48,8 @@ export interface SessionState {
   sessionId: string | null;
   /** Provider/model this session was created with; null = engine default. */
   model: ModelOption | null;
+  /** Permission mode this session was created with; null = engine default. */
+  permissionMode: PermissionMode | null;
   timeline: TimelineItem[];
   plan: PlanEntry[];
   busy: boolean;
@@ -54,7 +57,12 @@ export interface SessionState {
 }
 
 type Action =
-  | { type: "session_ready"; sessionId: string; model: ModelOption | null }
+  | {
+      type: "session_ready";
+      sessionId: string;
+      model: ModelOption | null;
+      permissionMode: PermissionMode | null;
+    }
   | { type: "user_prompt"; text: string }
   | { type: "acp_update"; update: SessionUpdate }
   | { type: "permission_request"; request: PermissionRequest }
@@ -68,6 +76,7 @@ const genId = () => `t${nextId++}`;
 const initial: SessionState = {
   sessionId: null,
   model: null,
+  permissionMode: null,
   timeline: [],
   plan: [],
   busy: false,
@@ -77,7 +86,12 @@ const initial: SessionState = {
 function reduce(state: SessionState, action: Action): SessionState {
   switch (action.type) {
     case "session_ready":
-      return { ...state, sessionId: action.sessionId, model: action.model };
+      return {
+        ...state,
+        sessionId: action.sessionId,
+        model: action.model,
+        permissionMode: action.permissionMode,
+      };
     case "user_prompt":
       return {
         ...state,
@@ -185,10 +199,11 @@ function appendText(
 export function useSession(
   cwd: string,
   target: SessionTarget,
-  // Read once per session creation. A stable getter (not a value) so that
-  // changing the picker never tears down the running session — the choice
-  // only applies to the next session this hook creates.
+  // Read once per session creation. Stable getters (not values) so that
+  // changing a picker never tears down the running session — the choices
+  // only apply to the next session this hook creates.
   getModelChoice?: () => ModelOption | null,
+  getPermissionMode?: () => PermissionMode | null,
 ) {
   const [state, dispatch] = useReducer(reduce, initial);
   const sessionRef = useRef<string | null>(null);
@@ -228,16 +243,33 @@ export function useSession(
         if (target.kind === "load") {
           // session_ready only after the load succeeds: a failed load must
           // not leave a promptable session pointing at unseen context.
-          // Resumed sessions keep the provider/model they were created with;
-          // the picker's pending choice applies only to fresh sessions.
+          // Resumed sessions keep the provider/model and permission mode they
+          // were created with; the pickers' pending choices apply only to
+          // fresh sessions.
           await loadSession(target.sessionId, target.workingDir || cwd);
           if (disposed) return;
-          dispatch({ type: "session_ready", sessionId: target.sessionId, model: null });
+          dispatch({
+            type: "session_ready",
+            sessionId: target.sessionId,
+            model: null,
+            permissionMode: null,
+          });
         } else {
           const choice = getModelChoice?.() ?? null;
-          const id = await newSession(cwd, choice?.provider, choice?.model);
+          const mode = getPermissionMode?.() ?? null;
+          const id = await newSession(
+            cwd,
+            choice?.provider,
+            choice?.model,
+            mode ?? undefined,
+          );
           if (disposed) return;
-          dispatch({ type: "session_ready", sessionId: id, model: choice });
+          dispatch({
+            type: "session_ready",
+            sessionId: id,
+            model: choice,
+            permissionMode: mode,
+          });
         }
       } catch (e) {
         if (!disposed) dispatch({ type: "error", message: String(e) });
@@ -255,7 +287,7 @@ export function useSession(
         void acpCancel(sessionRef.current);
       }
     };
-  }, [cwd, target, getModelChoice]);
+  }, [cwd, target, getModelChoice, getPermissionMode]);
 
   const send = useCallback(async (text: string) => {
     const id = sessionRef.current;

@@ -1,7 +1,50 @@
 import { useEffect, useState } from "react";
-import type { ModelOption } from "../acp/types";
+import type { ModelOption, PermissionMode } from "../acp/types";
 
 const optionKey = (m: ModelOption) => `${m.provider}/${m.model}`;
+
+/** The five per-session permission modes, in escalation order. Tones map to
+ * the semantic accents in tokens.css. */
+const PERMISSION_MODES: Array<{
+  id: PermissionMode;
+  label: string;
+  desc: string;
+  tone: "green" | "amber" | "blue" | "red";
+}> = [
+  {
+    id: "read-only",
+    label: "Read-only",
+    desc: "Read and search only; edits and shell denied",
+    tone: "green",
+  },
+  {
+    id: "ask",
+    label: "Ask",
+    desc: "Prompts before edits, shell, and MCP",
+    tone: "amber",
+  },
+  {
+    id: "accept-edits",
+    label: "Accept edits",
+    desc: "File edits run; shell and MCP prompt",
+    tone: "amber",
+  },
+  {
+    id: "auto",
+    label: "Auto",
+    desc: "Edits and shell run; MCP prompts",
+    tone: "blue",
+  },
+  {
+    id: "bypass",
+    label: "Bypass",
+    desc: "Every tool runs without prompting",
+    tone: "red",
+  },
+];
+
+const modeInfo = (id: PermissionMode) =>
+  PERMISSION_MODES.find((m) => m.id === id) ?? PERMISSION_MODES[1];
 
 export function Composer(props: {
   busy: boolean;
@@ -14,18 +57,27 @@ export function Composer(props: {
   /** Pending choice for the NEXT session; null = engine default. */
   modelChoice: ModelOption | null;
   onModelChoice: (m: ModelOption) => void;
+  /** Mode the ACTIVE session was created with; null = engine default (ask). */
+  sessionPermissionMode: PermissionMode | null;
+  /** Pending mode for the NEXT session; null = engine default (ask). */
+  permissionMode: PermissionMode | null;
+  onPermissionMode: (m: PermissionMode) => void;
 }) {
   const [text, setText] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [modeOpen, setModeOpen] = useState(false);
 
   useEffect(() => {
-    if (!pickerOpen) return;
+    if (!pickerOpen && !modeOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setPickerOpen(false);
+      if (e.key === "Escape") {
+        setPickerOpen(false);
+        setModeOpen(false);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [pickerOpen]);
+  }, [pickerOpen, modeOpen]);
 
   const submit = () => {
     const t = text.trim();
@@ -45,6 +97,16 @@ export function Composer(props: {
   const choose = (m: ModelOption) => {
     props.onModelChoice(m);
     setPickerOpen(false);
+  };
+
+  // The chip reflects the mode the active session actually runs under; the
+  // checkmark reflects what the next session will use. Engine default is ask.
+  const activeMode = modeInfo(props.sessionPermissionMode ?? "ask");
+  const pendingMode = props.permissionMode ?? "ask";
+
+  const chooseMode = (m: PermissionMode) => {
+    props.onPermissionMode(m);
+    setModeOpen(false);
   };
 
   return (
@@ -68,7 +130,61 @@ export function Composer(props: {
             }}
           />
           <div className="composer-row">
-            <button className="mode-chip">Ask</button>
+            <div className="mode-picker">
+              <button
+                className={`mode-chip tone-${activeMode.tone}`}
+                onClick={() => setModeOpen((open) => !open)}
+                aria-haspopup="listbox"
+                aria-expanded={modeOpen}
+              >
+                {activeMode.label}
+                <span className="mode-caret">▾</span>
+              </button>
+              {modeOpen ? (
+                <>
+                  <div
+                    className="model-backdrop"
+                    onClick={() => setModeOpen(false)}
+                  />
+                  <div className="model-pop mode-pop" role="listbox">
+                    <div className="model-pop-hint">
+                      Permission mode — applies to new sessions
+                    </div>
+                    {PERMISSION_MODES.map((m) => {
+                      const selected = m.id === pendingMode;
+                      return (
+                        <button
+                          key={m.id}
+                          className={
+                            selected
+                              ? `mode-opt selected tone-${m.tone}`
+                              : `mode-opt tone-${m.tone}`
+                          }
+                          role="option"
+                          aria-selected={selected}
+                          onClick={() => chooseMode(m.id)}
+                        >
+                          <span className={`mode-dot tone-${m.tone}`} />
+                          <span className="mode-opt-body">
+                            <span className="mode-opt-label">{m.label}</span>
+                            <span className="mode-opt-desc">{m.desc}</span>
+                            {m.id === "bypass" ? (
+                              <span className="mode-opt-warning">
+                                No approval prompts at all — only for
+                                workspaces you fully trust.
+                              </span>
+                            ) : null}
+                          </span>
+                          {selected ? (
+                            <span className="model-opt-check">✓</span>
+                          ) : null}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </>
+              ) : null}
+            </div>
             {props.busy ? (
               <button className="btn" onClick={props.onStop}>
                 Stop

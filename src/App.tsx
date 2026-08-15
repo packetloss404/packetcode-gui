@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { listModels, probeEngine, startEngine } from "./acp/client";
-import type { EngineProbe, ModelOption, SessionSummary } from "./acp/types";
+import type {
+  EngineProbe,
+  ModelOption,
+  PermissionMode,
+  SessionSummary,
+} from "./acp/types";
 import { Gate } from "./components/Gate";
 import { InstallGate } from "./components/InstallGate";
 import { SessionView } from "./components/SessionView";
@@ -24,6 +29,15 @@ export default function App() {
   const [models, setModels] = useState<ModelOption[]>([]);
   const [modelChoice, setModelChoice] = useState<ModelOption | null>(null);
   const onModelChoice = useCallback((m: ModelOption) => setModelChoice(m), []);
+  // Permission mode for the NEXT session; null = engine default ("ask").
+  // Running sessions keep the policy they were created with.
+  const [permissionMode, setPermissionMode] = useState<PermissionMode | null>(
+    null,
+  );
+  const onPermissionMode = useCallback(
+    (m: PermissionMode) => setPermissionMode(m),
+    [],
+  );
 
   const onSelectSession = useCallback((s: SessionSummary) => {
     setActiveSessionId(s.sessionId);
@@ -131,6 +145,8 @@ export default function App() {
         models={models}
         modelChoice={modelChoice}
         onModelChoice={onModelChoice}
+        permissionMode={permissionMode}
+        onPermissionMode={onPermissionMode}
       />
     </div>
   );

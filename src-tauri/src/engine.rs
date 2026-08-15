@@ -505,27 +505,26 @@ async fn bridge_of(state: &EngineState) -> Result<Arc<AcpBridge>, String> {
         .ok_or_else(|| "engine not started".to_string())
 }
 
-pub async fn new_session_on(
-    state: &EngineState,
-    cwd: &str,
+/// Builds the `session/new` params object. Optional per-session provider,
+/// model, and permission-mode overrides ride in the engine's "_packetcode"
+/// vendor-extension params object. The extension is omitted entirely when the
+/// caller wants the engine defaults, so older engines see a spec-only call;
+/// engines too old for a given field ignore it (plain JSON decode).
+fn new_session_params(
+    cwd_abs: &str,
     provider: Option<String>,
     model: Option<String>,
-) -> Result<String, String> {
-    let abs = std::fs::canonicalize(cwd)
-        .map_err(|e| format!("cwd {cwd}: {e}"))?
-        .to_string_lossy()
-        .to_string();
-    // Windows canonicalize yields \\?\ paths; the engine wants plain absolutes.
-    let abs = abs.trim_start_matches(r"\\?\").to_string();
-    let mut params = json!({ "cwd": abs, "mcpServers": [] });
-    // Optional per-session provider/model override, carried in the engine's
-    // "_packetcode" vendor-extension params object. Omitted entirely when the
-    // caller wants the engine defaults, so older engines see a spec-only call.
+    permission_mode: Option<String>,
+) -> Value {
+    let mut params = json!({ "cwd": cwd_abs, "mcpServers": [] });
     let provider = provider
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
     let model = model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
-    if provider.is_some() || model.is_some() {
+    let permission_mode = permission_mode
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    if provider.is_some() || model.is_some() || permission_mode.is_some() {
         let mut ext = serde_json::Map::new();
         if let Some(p) = provider {
             ext.insert("provider".into(), json!(p));
@@ -533,11 +532,31 @@ pub async fn new_session_on(
         if let Some(m) = model {
             ext.insert("model".into(), json!(m));
         }
+        if let Some(mode) = permission_mode {
+            ext.insert("permissionMode".into(), json!(mode));
+        }
         params
             .as_object_mut()
             .expect("session/new params are an object")
             .insert("_packetcode".into(), Value::Object(ext));
     }
+    params
+}
+
+pub async fn new_session_on(
+    state: &EngineState,
+    cwd: &str,
+    provider: Option<String>,
+    model: Option<String>,
+    permission_mode: Option<String>,
+) -> Result<String, String> {
+    let abs = std::fs::canonicalize(cwd)
+        .map_err(|e| format!("cwd {cwd}: {e}"))?
+        .to_string_lossy()
+        .to_string();
+    // Windows canonicalize yields \\?\ paths; the engine wants plain absolutes.
+    let abs = abs.trim_start_matches(r"\\?\").to_string();
+    let params = new_session_params(&abs, provider, model, permission_mode);
     let result = bridge_of(state)
         .await?
         .request("session/new", params, REQUEST_TIMEOUT)
@@ -589,9 +608,10 @@ pub async fn engine_new_session(
     cwd: String,
     provider: Option<String>,
     model: Option<String>,
+    permission_mode: Option<String>,
     state: State<'_, EngineState>,
 ) -> Result<String, String> {
-    new_session_on(&state, &cwd, provider, model).await
+    new_session_on(&state, &cwd, provider, model, permission_mode).await
 }
 
 pub async fn prompt_on(
@@ -927,7 +947,8 @@ pub async fn engine_stop(state: State<'_, EngineState>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::version_at_least;
+    use super::{new_session_params, version_at_least};
+    use serde_json::json;
 
     #[test]
     fn version_gate() {
@@ -938,5 +959,35 @@ mod tests {
         assert!(version_at_least("dev", "0.1.0"));
         assert!(!version_at_least("0.0.9", "0.1.0"));
         assert!(!version_at_least("garbage", "0.1.0"));
+    }
+
+    #[test]
+    fn session_params_omit_extension_when_unset() {
+        let params = new_session_params("/w", None, None, None);
+        assert_eq!(params, json!({ "cwd": "/w", "mcpServers": [] }));
+        // Blank-only overrides are treated as unset.
+        let params = new_session_params("/w", Some("  ".into()), None, Some("".into()));
+        assert_eq!(params, json!({ "cwd": "/w", "mcpServers": [] }));
+    }
+
+    #[test]
+    fn session_params_carry_packetcode_overrides() {
+        let params = new_session_params(
+            "/w",
+            Some("anthropic".into()),
+            Some("claude-fable-5".into()),
+            Some("accept-edits".into()),
+        );
+        assert_eq!(
+            params["_packetcode"],
+            json!({
+                "provider": "anthropic",
+                "model": "claude-fable-5",
+                "permissionMode": "accept-edits",
+            })
+        );
+        // A mode alone still rides the extension object.
+        let params = new_session_params("/w", None, None, Some("bypass".into()));
+        assert_eq!(params["_packetcode"], json!({ "permissionMode": "bypass" }));
     }
 }

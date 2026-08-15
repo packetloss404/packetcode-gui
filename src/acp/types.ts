@@ -82,6 +82,16 @@ export interface SessionSummary {
   costUsd: number;
 }
 
+// Per-session permission mode, mirroring the engine's `_packetcode`
+// permissionMode vocabulary (initialize advertises it under
+// agentCapabilities._packetcode.permissionModes).
+export type PermissionMode =
+  | "ask"
+  | "accept-edits"
+  | "auto"
+  | "read-only"
+  | "bypass";
+
 // One selectable provider/model pair from `_packetcode/models/list`.
 // `default` marks the pair the engine uses when session/new carries no
 // override.
