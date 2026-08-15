@@ -8,9 +8,10 @@ import type {
   ModelOption,
   PermissionMode,
   PermissionRequest,
+  PromptOutcome,
   SessionNotification,
   SessionSummary,
-  StopReason,
+  SessionUsage,
 } from "./types";
 
 export function probeEngine(): Promise<EngineProbe> {
@@ -41,8 +42,14 @@ export function loadSession(sessionId: string, cwd: string): Promise<void> {
   return invoke("engine_load_session", { sessionId, cwd });
 }
 
-export function prompt(sessionId: string, text: string): Promise<StopReason> {
-  return invoke<StopReason>("engine_prompt", { sessionId, text });
+export function prompt(sessionId: string, text: string): Promise<PromptOutcome> {
+  return invoke<PromptOutcome>("engine_prompt", { sessionId, text });
+}
+
+/** Usage for one session via `_packetcode/sessions/usage`. Null when the
+ * engine predates the extension (method-not-found). */
+export function sessionUsage(sessionId: string): Promise<SessionUsage | null> {
+  return invoke<SessionUsage | null>("engine_session_usage", { sessionId });
 }
 
 export function cancel(sessionId: string): Promise<void> {

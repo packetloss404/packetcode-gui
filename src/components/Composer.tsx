@@ -1,8 +1,43 @@
 import { useEffect, useState } from "react";
-import type { ModelOption, PermissionMode } from "../acp/types";
+import type { ModelOption, PermissionMode, SessionUsage } from "../acp/types";
 import { projectName } from "../project/projects";
 
 const optionKey = (m: ModelOption) => `${m.provider}/${m.model}`;
+
+/** Compact token count: 820 -> "820", 41234 -> "41.2k", 1200000 -> "1.2M".
+ * The M threshold sits just below 1M so 999,950+ rounds to "1M", not "1000k". */
+function fmtTokens(n: number): string {
+  const scaled = (value: number, suffix: string) => {
+    const rounded = Math.round(value * 10) / 10;
+    const text = Number.isInteger(rounded)
+      ? String(rounded)
+      : rounded.toFixed(1);
+    return text + suffix;
+  };
+  if (n >= 999_950) return scaled(n / 1_000_000, "M");
+  if (n >= 1000) return scaled(n / 1000, "k");
+  return String(n);
+}
+
+/** "$1.84"; sub-cent spend keeps a third digit, and anything below a tenth of
+ * a cent shows as "<$0.001" rather than a misleading zero. */
+function fmtCost(usd: number): string {
+  if (usd >= 0.01) return `$${usd.toFixed(2)}`;
+  if (usd >= 0.0005) return `$${usd.toFixed(3)}`;
+  return "<$0.001";
+}
+
+/** `ctx 41.2k tok · in 82k · out 12k · $1.84`, omitting unknown/zero
+ * segments; null when there is nothing to show. */
+export function usageStatusline(usage: SessionUsage | null): string | null {
+  if (!usage) return null;
+  const segments: string[] = [];
+  if (usage.contextTokens > 0) segments.push(`ctx ${fmtTokens(usage.contextTokens)} tok`);
+  if (usage.totalInput > 0) segments.push(`in ${fmtTokens(usage.totalInput)}`);
+  if (usage.totalOutput > 0) segments.push(`out ${fmtTokens(usage.totalOutput)}`);
+  if (usage.costUsd > 0) segments.push(fmtCost(usage.costUsd));
+  return segments.length > 0 ? segments.join(" · ") : null;
+}
 
 /** The five per-session permission modes, in escalation order. Tones map to
  * the semantic accents in tokens.css. */
@@ -67,6 +102,8 @@ export function Composer(props: {
   /** Pending mode for the NEXT session; null = engine default (ask). */
   permissionMode: PermissionMode | null;
   onPermissionMode: (m: PermissionMode) => void;
+  /** Token/cost usage for the ACTIVE session; null hides the statusline. */
+  usage: SessionUsage | null;
 }) {
   const [text, setText] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -114,6 +151,8 @@ export function Composer(props: {
     props.onPermissionMode(m);
     setModeOpen(false);
   };
+
+  const statusline = usageStatusline(props.usage);
 
   return (
     <div className="composer-zone">
@@ -276,6 +315,11 @@ export function Composer(props: {
           </div>
         </div>
       </div>
+      {statusline ? (
+        <div className="statusline">
+          <span>{statusline}</span>
+        </div>
+      ) : null}
     </div>
   );
 }

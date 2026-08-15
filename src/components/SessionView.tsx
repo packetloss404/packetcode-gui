@@ -76,6 +76,7 @@ export function SessionView(props: {
         sessionPermissionMode={state.permissionMode}
         permissionMode={props.permissionMode}
         onPermissionMode={props.onPermissionMode}
+        usage={state.usage}
       />
     </section>
   );

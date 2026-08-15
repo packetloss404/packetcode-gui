@@ -10,6 +10,7 @@ import {
   onSessionUpdate,
   prompt,
   replyPermission,
+  sessionUsage,
 } from "../acp/client";
 import type {
   ModelOption,
@@ -17,6 +18,7 @@ import type {
   PermissionRequest,
   PlanEntry,
   SessionUpdate,
+  SessionUsage,
   ToolCallStatus,
   ToolKind,
 } from "../acp/types";
@@ -54,6 +56,9 @@ export interface SessionState {
   plan: PlanEntry[];
   busy: boolean;
   error: string | null;
+  /** Latest token/cost usage for this session; null until known (fresh
+   * session with no turns yet, or an engine without the usage extension). */
+  usage: SessionUsage | null;
 }
 
 type Action =
@@ -68,6 +73,7 @@ type Action =
   | { type: "permission_request"; request: PermissionRequest }
   | { type: "permission_resolved"; requestId: string | number; optionId: string }
   | { type: "turn_done" }
+  | { type: "usage"; usage: SessionUsage }
   | { type: "error"; message: string };
 
 let nextId = 0;
@@ -81,6 +87,7 @@ const initial: SessionState = {
   plan: [],
   busy: false,
   error: null,
+  usage: null,
 };
 
 function reduce(state: SessionState, action: Action): SessionState {
@@ -100,6 +107,8 @@ function reduce(state: SessionState, action: Action): SessionState {
       };
     case "turn_done":
       return { ...state, busy: false };
+    case "usage":
+      return { ...state, usage: action.usage };
     case "error":
       return { ...state, busy: false, error: action.message };
     case "permission_request":
@@ -215,6 +224,8 @@ export function useSession(
   busyRef.current = state.busy;
   const onTurnCompleteRef = useRef(onTurnComplete);
   onTurnCompleteRef.current = onTurnComplete;
+  // Monotonic turn counter; guards the usage fallback against stale writes.
+  const turnSeqRef = useRef(0);
 
   useEffect(() => {
     let disposed = false;
@@ -259,6 +270,13 @@ export function useSession(
             model: null,
             permissionMode: null,
           });
+          // Resumed sessions may already have spend; hydrate the statusline.
+          // Best-effort: old engines answer null, failures stay quiet.
+          void sessionUsage(target.sessionId)
+            .then((usage) => {
+              if (!disposed && usage) dispatch({ type: "usage", usage });
+            })
+            .catch(() => {});
         } else {
           const choice = getModelChoice?.() ?? null;
           const mode = getPermissionMode?.() ?? null;
@@ -300,14 +318,34 @@ export function useSession(
   const send = useCallback(async (text: string) => {
     const id = sessionRef.current;
     if (!id) return;
+    turnSeqRef.current += 1;
     dispatch({ type: "user_prompt", text });
+    let outcome;
     try {
-      await prompt(id, text);
+      outcome = await prompt(id, text);
     } catch (e) {
       dispatch({ type: "error", message: String(e) });
       return;
     }
     dispatch({ type: "turn_done" });
+    // Newer engines attach usage to the prompt result; otherwise (older
+    // engine, or a cancelled turn) fall back to an explicit query. Both are
+    // best-effort — the statusline just goes stale on failure. The sequence
+    // guard drops a slow fallback response that would otherwise overwrite a
+    // newer turn's enriched usage.
+    if (outcome?.usage) {
+      dispatch({ type: "usage", usage: outcome.usage });
+    } else {
+      const seq = turnSeqRef.current;
+      try {
+        const usage = await sessionUsage(id);
+        if (usage && turnSeqRef.current === seq) {
+          dispatch({ type: "usage", usage });
+        }
+      } catch {
+        // engine predates the extension or the read failed; keep quiet
+      }
+    }
     onTurnCompleteRef.current?.();
   }, []);
 

@@ -57,6 +57,7 @@ export function ProjectGate(props: {
         sessionPermissionMode={null}
         permissionMode={null}
         onPermissionMode={() => undefined}
+        usage={null}
       />
     </section>
   );

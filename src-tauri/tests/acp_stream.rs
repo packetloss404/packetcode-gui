@@ -4,8 +4,9 @@
 //! instead of a Tauri AppHandle; no packetcode binary is required.
 
 use packetcode_gui_lib::engine::{
-    cancel_on, new_session_on, permission_reply_on, prompt_on, rename_session_on, start_engine,
-    stop_on, AcpEvents, EngineState,
+    cancel_on, new_session_on, permission_reply_on, prompt_on, rename_session_on,
+    session_usage_on, start_engine, stop_on, AcpEvents, EngineState, PromptOutcome,
+    SessionUsage,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -44,17 +45,35 @@ fn mock_engine_path() -> String {
 }
 
 async fn start_mock() -> (Arc<EngineState>, mpsc::UnboundedReceiver<Event>) {
+    start_mock_with(&[]).await
+}
+
+async fn start_mock_with(
+    extra_args: &[&str],
+) -> (Arc<EngineState>, mpsc::UnboundedReceiver<Event>) {
     let state = Arc::new(EngineState::default());
     let (tx, rx) = mpsc::unbounded_channel();
     let mock = mock_engine_path();
+    let mut args = vec![mock.as_str(), "acp"];
+    args.extend_from_slice(extra_args);
     timeout(
         STEP,
-        start_engine(&state, "node", &[&mock, "acp"], Arc::new(TestSink { tx })),
+        start_engine(&state, "node", &args, Arc::new(TestSink { tx })),
     )
     .await
     .expect("start_engine timed out")
     .expect("start_engine failed");
     (state, rx)
+}
+
+/// The usage values baked into the mock engine's scripted responses.
+fn mock_usage() -> SessionUsage {
+    SessionUsage {
+        context_tokens: 41234,
+        total_input: 82000,
+        total_output: 12000,
+        cost_usd: 1.84,
+    }
 }
 
 async fn next_event(rx: &mut mpsc::UnboundedReceiver<Event>) -> Event {
@@ -105,7 +124,7 @@ fn spawn_prompt(
     state: &Arc<EngineState>,
     session_id: &str,
     text: &str,
-) -> tokio::task::JoinHandle<Result<String, String>> {
+) -> tokio::task::JoinHandle<Result<PromptOutcome, String>> {
     let state = state.clone();
     let session_id = session_id.to_string();
     let text = text.to_string();
@@ -191,12 +210,14 @@ async fn happy_path_streams_events_in_order() {
     assert_eq!(kind(&u), "agent_message_chunk");
     assert_eq!(chunk_text(&u), "Permission granted, continuing.");
 
-    let stop = timeout(STEP, turn)
+    let outcome = timeout(STEP, turn)
         .await
         .expect("prompt did not finish")
         .expect("prompt task panicked")
         .expect("prompt failed");
-    assert_eq!(stop, "end_turn");
+    assert_eq!(outcome.stop_reason, "end_turn");
+    // The engine enriches successful turns with usage; the bridge surfaces it.
+    assert_eq!(outcome.usage, Some(mock_usage()));
 
     stop_on(&state).await.unwrap();
 }
@@ -220,8 +241,8 @@ async fn permission_reject_fails_tool_and_ends_turn() {
     assert_eq!(kind(&u), "tool_call_update");
     assert_eq!(tool_status(&u), "failed");
 
-    let stop = timeout(STEP, turn).await.unwrap().unwrap().unwrap();
-    assert_eq!(stop, "end_turn");
+    let outcome = timeout(STEP, turn).await.unwrap().unwrap().unwrap();
+    assert_eq!(outcome.stop_reason, "end_turn");
 
     // Answering the same request twice must fail cleanly.
     let err = permission_reply_on(&state, &request_id, "allow_once")
@@ -250,8 +271,10 @@ async fn cancel_mid_prompt_yields_cancelled_and_rejects_late_permission_reply() 
         .expect("cancel deadlocked while prompt was in flight")
         .expect("cancel failed");
 
-    let stop = timeout(STEP, turn).await.unwrap().unwrap().unwrap();
-    assert_eq!(stop, "cancelled");
+    let outcome = timeout(STEP, turn).await.unwrap().unwrap().unwrap();
+    assert_eq!(outcome.stop_reason, "cancelled");
+    // Cancelled turns are not enriched.
+    assert_eq!(outcome.usage, None);
 
     // The permission request was answered "cancelled" on our side; a late
     // user reply must be rejected instead of double-answering the agent.
@@ -270,8 +293,8 @@ async fn cancel_mid_prompt_yields_cancelled_and_rejects_late_permission_reply() 
         .unwrap();
     let u = next_update(&mut rx).await;
     assert_eq!(chunk_text(&u), "Permission granted, continuing.");
-    let stop2 = timeout(STEP, turn2).await.unwrap().unwrap().unwrap();
-    assert_eq!(stop2, "end_turn");
+    let outcome2 = timeout(STEP, turn2).await.unwrap().unwrap().unwrap();
+    assert_eq!(outcome2.stop_reason, "end_turn");
 
     stop_on(&state).await.unwrap();
 }
@@ -291,8 +314,8 @@ async fn cancel_during_streaming_chunks_yields_cancelled() {
         .expect("cancel deadlocked")
         .expect("cancel failed");
 
-    let stop = timeout(STEP, turn).await.unwrap().unwrap().unwrap();
-    assert_eq!(stop, "cancelled");
+    let outcome = timeout(STEP, turn).await.unwrap().unwrap().unwrap();
+    assert_eq!(outcome.stop_reason, "cancelled");
 
     // Anything already in flight when the cancel landed is fine; the session
     // must still accept new turns afterwards.
@@ -320,8 +343,8 @@ async fn malformed_and_interleaved_lines_do_not_wedge_the_reader() {
         assert_eq!(chunk_text(&u), expected);
     }
 
-    let stop = timeout(STEP, turn).await.unwrap().unwrap().unwrap();
-    assert_eq!(stop, "end_turn");
+    let outcome = timeout(STEP, turn).await.unwrap().unwrap().unwrap();
+    assert_eq!(outcome.stop_reason, "end_turn");
 
     // Reader is still routing traffic after the garbage.
     let session2 = new_session_on(&state, ".", None, None, None).await.unwrap();
@@ -336,11 +359,51 @@ async fn rename_on_engine_without_extension_is_silently_skipped() {
     // same as a real engine that predates the extension. The bridge must treat
     // that as success so auto-titling never surfaces errors on old engines.
     let (state, _rx) = start_mock().await;
-    let session = new_session_on(&state, ".", None, None).await.unwrap();
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
     timeout(STEP, rename_session_on(&state, &session, "My first prompt"))
         .await
         .expect("rename timed out")
         .expect("rename against an old engine should silently succeed");
+    stop_on(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn session_usage_query_returns_engine_values() {
+    let (state, _rx) = start_mock().await;
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+
+    let usage = timeout(STEP, session_usage_on(&state, &session))
+        .await
+        .expect("usage query timed out")
+        .expect("usage query failed");
+    assert_eq!(usage, Some(mock_usage()));
+
+    stop_on(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn session_usage_is_none_on_engines_without_the_extension() {
+    let (state, mut rx) = start_mock_with(&["--no-usage"]).await;
+    let session = new_session_on(&state, ".", None, None, None).await.unwrap();
+
+    // Method-not-found maps to None (feature absent), not an error.
+    let usage = timeout(STEP, session_usage_on(&state, &session))
+        .await
+        .expect("usage query timed out")
+        .expect("usage query should not error on -32601");
+    assert_eq!(usage, None);
+
+    // Prompt results from such engines carry no usage either.
+    let turn = spawn_prompt(&state, &session, "garbage");
+    let u = next_update(&mut rx).await;
+    assert_eq!(kind(&u), "agent_thought_chunk");
+    for _ in 0..3 {
+        next_update(&mut rx).await;
+    }
+    let outcome = timeout(STEP, turn).await.unwrap().unwrap().unwrap();
+    assert_eq!(outcome.stop_reason, "end_turn");
+    assert_eq!(outcome.usage, None);
+
     stop_on(&state).await.unwrap();
 }
 
