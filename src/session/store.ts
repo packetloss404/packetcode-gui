@@ -35,6 +35,7 @@
 //     session simply loads it again into a fresh slot.
 
 import type {
+  McpServerStatus,
   ModelOption,
   PermissionMode,
   PermissionRequest,
@@ -115,6 +116,18 @@ export interface SessionEntry {
    * and a slot is stamped on open so a session the user just created is never
    * the coldest thing in the store. */
   viewSeq: number;
+  /** Whether this session was opened asking the engine for its own configured
+   * MCP servers. Fixed at open: flipping the setting later cannot retrofit a
+   * fleet onto a running session, and the chip must not pretend otherwise. */
+  mcpInherited: boolean;
+  /** This session's live MCP fleet from `_packetcode/mcp/list`. Empty for a
+   * session that inherited none, and for engines without the extension.
+   *
+   * Deliberately per-slot rather than a global cache keyed by session id: it
+   * is a property of a live runtime, so it must die with the slot. A session
+   * the engine has evicted has no fleet, and stale entries in a longer-lived
+   * cache would outlive the processes they describe. */
+  mcpServers: McpServerStatus[];
 }
 
 /** A permission reply the reducer decided on but cannot perform: reducers are
@@ -163,6 +176,8 @@ export type Action =
       key: SessionKey;
       origin: "new" | "load";
       cwd: string;
+      /** Whether this session asked to inherit the engine's MCP servers. */
+      inheritMcp: boolean;
       /** Known up front for a resumed session, null for a fresh one. */
       sessionId: string | null;
     }
@@ -195,7 +210,8 @@ export type Action =
   | { type: "touch"; key: SessionKey }
   /** Drop these slots entirely. The engine-side `session/close` is the
    * provider's job; the reducer only forgets. */
-  | { type: "evict"; keys: SessionKey[] };
+  | { type: "evict"; keys: SessionKey[] }
+  | { type: "mcp_servers"; key: SessionKey; servers: McpServerStatus[] };
 
 let nextId = 0;
 const genId = () => `t${nextId++}`;
@@ -380,6 +396,8 @@ export function reduce(state: StoreState, action: Action): StoreState {
         error: null,
         usage: null,
         viewSeq: stampView(),
+        mcpInherited: action.inheritMcp,
+        mcpServers: [],
       };
       return {
         ...state,
@@ -467,6 +485,11 @@ export function reduce(state: StoreState, action: Action): StoreState {
       // so the sidebar's history rows are exactly as they were.
       return dropped ? { ...state, entries, byId } : state;
     }
+    case "mcp_servers":
+      return patch(state, action.key, (entry) => ({
+        ...entry,
+        mcpServers: action.servers,
+      }));
     case "error":
       // Deliberately does NOT settle open approval cards. An error here is a
       // failed prompt or a failed permission reply — the engine never heard

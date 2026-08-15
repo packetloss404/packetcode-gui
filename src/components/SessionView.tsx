@@ -3,7 +3,7 @@
 // it leaves the session running.
 
 import { useCallback, useEffect, useRef } from "react";
-import type { ModelOption, PermissionMode } from "../acp/types";
+import type { McpServerStatus, ModelOption, PermissionMode } from "../acp/types";
 import { projectName } from "../project/projects";
 import { useSessions } from "../session/SessionsProvider";
 import { getEntry, isEngaged, resolveKey, type SessionTarget } from "../session/store";
@@ -24,8 +24,15 @@ export function SessionView(props: {
   engineDefaultMode: string | null;
   /** False only when the engine advertised no usage extension. */
   usageAvailable: boolean;
+  /** The engine's configured MCP servers; empty hides the MCP chip entirely
+   * (no engine support, or nothing configured). */
+  mcpConfigured: McpServerStatus[];
+  /** Whether NEW sessions inherit those servers — the user's stored consent,
+   * already intersected with what the engine can do. */
+  mcpInherit: boolean;
+  onMcpInherit: (on: boolean) => void;
 }) {
-  const { state, open, send, stop, answerPermission } = useSessions();
+  const { state, open, send, stop, answerPermission, refreshMcp } = useSessions();
   // Latest picker choices, readable without retriggering session creation:
   // changing a picker must never tear down or re-create a live session — the
   // choices only apply to the next session opened.
@@ -33,6 +40,11 @@ export function SessionView(props: {
   choiceRef.current = props.modelChoice;
   const modeRef = useRef<PermissionMode | null>(props.permissionMode);
   modeRef.current = props.permissionMode;
+  // Same rule for MCP consent: flipping it must not tear down a live session,
+  // so the session keeps the fleet it was opened with and the change lands on
+  // the next one — like the model and permission-mode pickers.
+  const mcpRef = useRef<boolean>(props.mcpInherit);
+  mcpRef.current = props.mcpInherit;
 
   const key = resolveKey(state, props.target);
   const entry = getEntry(state, key);
@@ -41,7 +53,7 @@ export function SessionView(props: {
   useEffect(() => {
     // Idempotent per slot: re-entering a session already in the store does not
     // re-issue session/load, which would replay its transcript a second time.
-    open(key, target, cwd, choiceRef.current, modeRef.current);
+    open(key, target, cwd, choiceRef.current, modeRef.current, mcpRef.current);
   }, [open, key, target, cwd]);
 
   const onSend = useCallback((text: string) => send(key, text), [send, key]);
@@ -92,7 +104,14 @@ export function SessionView(props: {
               <button
                 className="btn"
                 onClick={() =>
-                  open(key, target, cwd, choiceRef.current, modeRef.current)
+                  open(
+                    key,
+                    target,
+                    cwd,
+                    choiceRef.current,
+                    modeRef.current,
+                    mcpRef.current,
+                  )
                 }
               >
                 Retry
@@ -116,6 +135,18 @@ export function SessionView(props: {
         allowedPermissionModes={props.allowedPermissionModes}
         engineDefaultMode={props.engineDefaultMode}
         usage={entry?.usage ?? null}
+        mcp={
+          props.mcpConfigured.length === 0
+            ? null
+            : {
+                configured: props.mcpConfigured,
+                live: entry?.mcpServers ?? [],
+                sessionInherits: entry?.mcpInherited ?? false,
+                inherit: props.mcpInherit,
+                onInherit: props.onMcpInherit,
+                onRefresh: () => refreshMcp(key),
+              }
+        }
       />
     </section>
   );

@@ -6,6 +6,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   EngineCapabilities,
   EngineProbe,
+  McpServerStatus,
   ModelOption,
   PermissionMode,
   PermissionRequest,
@@ -31,24 +32,49 @@ export function engineCapabilities(): Promise<EngineCapabilities> {
   return invoke<EngineCapabilities>("engine_capabilities");
 }
 
+/** `inheritMcp` decides the session's MCP fleet: false sends the ACP-required
+ * `mcpServers: []` ("run with none"), true omits the field, which is the only
+ * way to ask a capable engine for its own configured servers — and therefore
+ * the only way this app starts those local subprocesses. It carries the user's
+ * stored consent; the Rust side intersects it with the engine's `mcpDefaults`
+ * promise, so an opted-in user on an old engine still gets a working session. */
 export function newSession(
   cwd: string,
   provider?: string,
   model?: string,
   permissionMode?: PermissionMode,
+  inheritMcp = false,
 ): Promise<string> {
   return invoke<string>("engine_new_session", {
     cwd,
     provider: provider ?? null,
     model: model ?? null,
     permissionMode: permissionMode ?? null,
+    inheritMcp,
   });
 }
 
 /** Resume a persisted session. Replay updates are emitted on `acp:update`
- * while this call is in flight — subscribe before invoking. */
-export function loadSession(sessionId: string, cwd: string): Promise<void> {
-  return invoke("engine_load_session", { sessionId, cwd });
+ * while this call is in flight — subscribe before invoking. `inheritMcp` is
+ * the same consent-carrying flag as on newSession: a resumed session starts a
+ * fleet of its own, so it has to be asked the same question. */
+export function loadSession(
+  sessionId: string,
+  cwd: string,
+  inheritMcp = false,
+): Promise<void> {
+  return invoke("engine_load_session", { sessionId, cwd, inheritMcp });
+}
+
+/** MCP servers via `_packetcode/mcp/list`. With a session id: that session's
+ * live fleet (what actually started, with tool counts and failures). Without
+ * one: the engine's configured servers, readable before any session exists —
+ * which is exactly what the consent disclosure lists. Resolves empty on
+ * engines predating the extension, so empty means "nothing to show". */
+export function listMcpServers(sessionId?: string): Promise<McpServerStatus[]> {
+  return invoke<McpServerStatus[]>("engine_list_mcp_servers", {
+    sessionId: sessionId ?? null,
+  });
 }
 
 export function prompt(sessionId: string, text: string): Promise<PromptOutcome> {

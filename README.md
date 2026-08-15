@@ -16,6 +16,7 @@ Packetcode Desktop does **not** bundle or reimplement the agent. It drives the s
 - **Slash commands and @ mentions** — the composer's `/` menu lists your markdown commands (the engine expands them server-side) and `@` searches project files
 - **Model picker** — per-session provider/model choice served by the engine's model catalog
 - **Usage statusline** — context occupancy, cumulative tokens, and cost under the composer after every turn
+- **MCP servers, only if you say so** — packetcode's own `[mcp.<name>]` servers are local programs, so the app never starts them behind your back: on first launch it lists them by name and command and asks, remembers the answer for the machine, and puts a click-to-expand chip above the composer showing what is running (amber only when a server actually failed) with the switch to turn it off again
 - **Guided install** — if no engine is found (or it's too old), the app offers packetcode's official install script with live output, then verifies the result
 
 ## Install
@@ -76,10 +77,16 @@ Vendor extensions (feature-detected via `agentCapabilities._packetcode` in the `
 | `_packetcode/models/list` | Provider/model catalog for the picker |
 | `_packetcode/commands/list` | Slash commands for the composer's `/` menu. The engine reports only markdown commands from `~/.packetcode/commands` and `<cwd>/.packetcode/commands`; its built-in slash commands are TUI affordances with no ACP equivalent. It expands a leading `/name` in `session/prompt` into the command's prompt |
 | `_packetcode/project/files` | Project file search for the composer's `@` menu, using the engine's own ignore rules |
+| `_packetcode/mcp/list` | MCP servers: with a `sessionId`, that session's live fleet (tool counts, startup failures); without one, the engine's configured servers — read before any session exists, which is what the consent dialog lists |
+| `initialize` `agentCapabilities._packetcode.mcpDefaults` | The engine's promise that an OMITTED `mcpServers` on `session/new` means "use your own configured servers". Read strictly: engines that never promised it reject the omission with invalid-params, so the app keeps sending `[]` |
 | `session/new` `_packetcode: {provider, model, permissionMode}` | Per-session model and permission-mode overrides (the engine caps requested modes at its configured profile) |
 | `initialize` `agentCapabilities._packetcode` | Advertised extension flags, allowed `permissionModes`, and `defaultPermissionMode` — the app offers only what the engine will accept |
 
 Both composer affordances degrade to an empty list on engines without them, and the composer's placeholder drops the promises it cannot keep — down to a bare "Do anything" when neither is served.
+
+`mcpServers` is the one field where absence is not neutrality: `[]` means "run this session with no MCP servers", a populated list means "exactly these", and only OMITTING the field asks a capable engine for its own configured fleet. Since that fleet is a set of local subprocesses, the app sends `[]` — starting none — until the user has seen the list of commands and agreed, and it stores that answer per machine (`packetcode.mcpInherit` in localStorage). The choice is reversible from the composer chip and applies to new sessions, exactly like the model and permission-mode pickers; running sessions keep the fleet they were opened with.
+
+The chip's live status is read when a session starts, again when a turn completes, and again when the panel is opened — a server that dies mid-turn is reported at the next of those, and the panel labels what it shows ("status as of the last completed turn") rather than implying a live subscription the protocol does not offer.
 
 Minimum engine version: `MINIMUM_ENGINE_VERSION` in `src-tauri/src/engine.rs`. packetcode keeps the ACP surface additive; the app must degrade, not crash, when a method is missing.
 

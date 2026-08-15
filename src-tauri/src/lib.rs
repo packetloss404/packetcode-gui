@@ -21,6 +21,7 @@ pub fn run() {
             engine::engine_rename_session,
             engine::engine_session_usage,
             engine::engine_list_models,
+            engine::engine_list_mcp_servers,
             engine::engine_list_commands,
             engine::engine_search_files,
             engine::engine_install,

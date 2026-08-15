@@ -11,7 +11,8 @@ export type PacketcodeExtension =
   | "sessionsList"
   | "sessionsRename"
   | "sessionsUsage"
-  | "modelsList";
+  | "modelsList"
+  | "mcpList";
 
 /** Whether `extension` may be used. Unknown capabilities (the read failed) and
  * unadvertising engines answer true: their -32601 fallback still decides, and
@@ -22,6 +23,18 @@ export function supports(
 ): boolean {
   if (caps === null || !caps.packetcode.advertised) return true;
   return caps.packetcode[extension];
+}
+
+/** Whether this engine may be asked to run its OWN configured MCP servers.
+ *
+ * The one capability read strictly, and the exception to the rule above: every
+ * other flag has a call-time -32601 fallback, so assuming support costs an
+ * error message. This one has no fallback in either direction. Asking is done
+ * by OMITTING `mcpServers` from session/new, and an engine that never promised
+ * `mcpDefaults` answers invalid-params — failing the whole session, not just a
+ * feature. An unadvertising engine therefore means "no", never "try it". */
+export function canInheritMcp(caps: EngineCapabilities | null): boolean {
+  return caps !== null && caps.packetcode.advertised && caps.packetcode.mcpDefaults;
 }
 
 /** Permission modes `session/new` will accept, or null when capabilities are
